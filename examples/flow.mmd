@@ -1,0 +1,15 @@
+---
+run: release-login
+defaults: {agent: claude-code, budget_tokens: 1000000}
+agents:
+  claude-code: {cmd: "claude -p --output-format stream-json", resume: session}
+  opencode: {cmd: "opencode run --format json --file __FLOW_PACKET_PATH__"}
+---
+flowchart TD
+  T001[实现登录API;;agent=claude-code;;out=src/auth.py,test/auth.spec.ts] --> J001
+  T002[实现登录UI;;agent=opencode;;out=src/ui/Login.tsx] --> J001
+  J001[集成准备] -->|when: all| D001{验收通过?}
+  D001 -->|when: ok| H001([发布人审])
+  H001 --> T004[打 tag 发布]
+  D001 -->|when: fail| T003[失败诊断;;agent=claude-code]
+  D001 -->|timeout: 30m| T005[超时诊断;;agent=claude-code]
