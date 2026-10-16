@@ -119,7 +119,11 @@ if ($installOk) {
 
   $listCode = 'import flowrun,pathlib;root=pathlib.Path(flowrun.__file__).parent;print(chr(10).join(sorted(str(p.relative_to(root)).replace(chr(92),"/") for p in root.rglob("*.py"))))'
   $installedModuleFiles = @((& $venvPython -c $listCode 2>$null) -split "`n" | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { $_.Trim() })
-  $repoModuleFiles = @(git ls-files "src/flowrun" | Where-Object { $_ -like "*.py" } | ForEach-Object { $_ -replace "^src/", "" })
+  # 仓库侧归一为"包根相对"路径（去掉 src/flowrun/），与安装侧（相对 flowrun/ 包根）同口径比较
+  $repoModuleFiles = @(
+    git ls-files "src/flowrun" | Where-Object { $_ -like "*.py" } |
+      ForEach-Object { ($_ -replace "^src/flowrun/", "").Replace("\", "/") }
+  )
   $missingInInstall = @($repoModuleFiles | Where-Object { $installedModuleFiles -notcontains $_ })
   $extraInInstall = @($installedModuleFiles | Where-Object { $repoModuleFiles -notcontains $_ })
   Assert-Check "installed package mirrors repo src/flowrun" (
@@ -146,7 +150,7 @@ if ($installOk) {
     @'
 ---
 run: verify-smoke
-defaults: {budget_tokens: 100000}
+defaults: {agent: verify-agent, budget_tokens: 100000}
 agents:
   verify-agent: {cmd: "python -c pass"}
 ---
