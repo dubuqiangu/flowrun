@@ -7,9 +7,10 @@ Implements tasks.md T003:
 - task nodes must not declare an empty 'out=' contract (decision/human/join
   nodes may have no contract)
 - 'out=' paths must stay inside the workspace: relative, no '..' segments,
-  no drive letter / absolute path (a path outside the workspace turns the
-  existence check into an oracle and lets an external file satisfy the
-  contract)
+  no drive letter / absolute path / root-relative form (a leading path
+  separator resolves against the drive root, not the workspace) (a path
+  outside the workspace turns the existence check into an oracle and lets an
+  external file satisfy the contract)
 - node agent= references must exist in the frontmatter agent registry
 - decision nodes need at least one outgoing edge with a non-'all' 'when:' condition
 - self-loop edges (source == target) are rejected
@@ -284,7 +285,15 @@ def _report_timeout_edge_violations(
 
 
 def _describe_invalid_output_path(output_path: str) -> str | None:
-    """FIX-4: return why an 'out=' path is unsafe, or None when it stays in the workspace."""
+    """FIX-4: return why an 'out=' path is unsafe, or None when it stays in the workspace.
+
+    四类都要拦：POSIX 绝对路径（``/etc/passwd``）、Windows 绝对路径
+    （``C:\\...``）、盘符相对（``C:x``）、**根相对**（``\\x`` / ``\\Windows\\win.ini``）。
+    最后一类最隐蔽：``PureWindowsPath(r"\\x").is_absolute()`` 是 False、``.drive``
+    也为空，但它带 ``.root``（盘根）——``workspace / r"\\Windows\\win.ini"`` 会解析
+    到盘根 ``C:\\Windows\\win.ini``，契约就跑到 workspace 外面去了。
+    UNC（``\\\\server\\share``）同样带 root，一并拒掉。
+    """
     if not output_path.strip():
         return "is empty"
     windows_path = PureWindowsPath(output_path)
@@ -292,6 +301,7 @@ def _describe_invalid_output_path(output_path: str) -> str | None:
         PurePosixPath(output_path).is_absolute()
         or windows_path.is_absolute()
         or bool(windows_path.drive)
+        or bool(windows_path.root)
     ):
         return "must be a relative path (absolute paths escape the workspace)"
     normalized_parts = PurePosixPath(output_path.replace("\\", "/")).parts

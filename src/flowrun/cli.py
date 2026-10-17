@@ -4,9 +4,10 @@ argparse 子命令 → 各域模块调用的薄装配层，不承载业务逻辑
 
 - ``compile <flow.mmd>``：编译校验，好图打印 FlowIR JSON；坏图打印行号错误
   清单并退出码 3（编译/校验/IO 失败）；
-- ``run <flow.mmd> --workspace <dir> [--dispatch-timeout 秒]``：编译 → 应用
-  todo 用户标记（上轮等待点的勾选在此落账续跑）→ 生成 AGENTS.stub →
-  run_flow。退出码：flow_done=0 / halted=2 / 其余等待点=1；
+- ``run <flow.mmd> --workspace <dir> [--dispatch-timeout 秒]``：编译 → **校验
+  工作区身份（先于任何写入，不符退 4 且不污染工作区）** → 应用 todo 用户标记
+  （上轮等待点的勾选在此落账续跑）→ 生成 AGENTS.stub → run_flow。退出码：
+  flow_done=0 / halted=2 / 其余等待点=1；
 - ``resume --flow <mmd> --workspace <dir>``：解除闸/暂停挂起——恢复 FlowState →
   校验工作区与图身份 → 落 ``flow_resumed``。退出码：恢复成功=0 /
   未处于暂停或已终止=1 / 工作区身份不匹配=4 / 工作区未初始化=5；
@@ -19,7 +20,8 @@ argparse 子命令 → 各域模块调用的薄装配层，不承载业务逻辑
 
 退出码契约（脚本可区分失败类别）：
 0=done / 1=waiting(paused/awaiting_human) / 2=halted /
-3=编译·校验·IO 失败 / 4=工作区与流程身份不匹配 / 5=工作区未初始化。
+3=编译·校验·IO 失败 / 4=工作区与流程身份不匹配 / 5=工作区未初始化 /
+6=账本损坏（ledger 中段不可解析或哈希链断裂，需人工检查或换新工作区）。
 
 异步入口统一 ``asyncio.run``（仅标准库）。所有对外输入只进结构化解析。
 """
@@ -35,7 +37,11 @@ from flowrun.compiler.frontmatter import FrontmatterError
 from flowrun.compiler.mermaid_parser import MermaidParseError
 from flowrun.compiler.validator import FlowValidationError, compile_flow_source
 from flowrun.ir.schema import FlowIR
-from flowrun.kernel.engine import run_flow
+from flowrun.kernel.engine import (
+    FlowWorkspaceMismatchError,
+    run_flow,
+    verify_workspace_matches_flow,
+)
 from flowrun.kernel.hooks_assembly import (
     DEFAULT_DISPATCH_TIMEOUT_SECONDS,
     build_engine_hooks,
@@ -52,16 +58,8 @@ from flowrun.state.flow_state import (
     STATUS_FAILED,
     FlowState,
 )
-from flowrun.state.ledger import EventLedger
+from flowrun.state.ledger import EventLedger, LedgerCorruptionError
 from flowrun.state.snapshots import SnapshotStore, recover_flow_state
-
-try:  # kernel 侧（并行线）定义；未就绪时以占位类兜底，保证 except 子句始终可绑定
-    from flowrun.kernel.engine import FlowWorkspaceMismatchError
-except ImportError:  # pragma: no cover - 取决于并行线进度
-
-    class FlowWorkspaceMismatchError(Exception):
-        """kernel 尚未导出该异常时的占位（仅用于捕获绑定，本模块绝不主动抛出）。"""
-
 
 __all__ = ["main"]
 
@@ -71,6 +69,7 @@ EXIT_FLOW_HALTED = 2
 EXIT_COMPILE_ERROR = 3
 EXIT_WORKSPACE_MISMATCH = 4
 EXIT_WORKSPACE_MISSING = 5
+EXIT_LEDGER_CORRUPTION = 6
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,9 +88,38 @@ def main(argv: list[str] | None = None) -> int:
     except (MermaidParseError, FrontmatterError) as parse_error:
         print(f"flow.mmd:{parse_error}", file=sys.stderr)
         return EXIT_COMPILE_ERROR
+    # LedgerCorruptionError 与 OSError 分属两条无继承关系的异常树（前者直接继承
+    # Exception），故本子句无论放在 OSError 之前还是之后都拦得住——放在前面只因
+    # "更具体的业务语义"优先，代码不依赖两个子句的先后顺序。
+    except LedgerCorruptionError as ledger_corruption_error:
+        print(
+            f"flowrun: {_describe_ledger_corruption(ledger_corruption_error, parsed_args)}",
+            file=sys.stderr,
+        )
+        return EXIT_LEDGER_CORRUPTION
     except OSError as io_error:
         print(f"flowrun: 无法读取流程文件 - {io_error}", file=sys.stderr)
         return EXIT_COMPILE_ERROR
+
+
+def _describe_ledger_corruption(
+    ledger_corruption_error: LedgerCorruptionError, parsed_args: argparse.Namespace
+) -> str:
+    """账本损坏的可读诊断（含工作区账本路径与原因，不给用户看 traceback）。
+
+    异常自身的文案只在"行级解析失败"时带路径，链断裂/快照核对失败不带；故此处
+    从子命令参数补出账本路径，保证任何损坏分支都指得到该检查哪个文件。
+    """
+    workspace_text = getattr(parsed_args, "workspace", None)
+    ledger_path_hint = (
+        f"账本 {_workspace_ledger_path(Path(workspace_text))}"
+        if workspace_text
+        else "工作区账本"
+    )
+    return (
+        f"账本损坏，无法恢复流程状态——请检查 {ledger_path_hint} 或改用新工作区；"
+        f"原因：{ledger_corruption_error}"
+    )
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -168,11 +196,16 @@ def _handle_compile(parsed_args: argparse.Namespace) -> int:
 def _handle_run(parsed_args: argparse.Namespace) -> int:
     flow_ir = _compile_flow_file(Path(parsed_args.flow_path))
     workspace = Path(parsed_args.workspace).resolve()
-    workspace.mkdir(parents=True, exist_ok=True)
 
-    # 上轮等待点留在 todo.md 的勾选/@pause/@skip/@resume 先落账，再驱动内核
+    # 身份校验必须先于一切写入：拿错工作区（B 流程跑 A 工作区）时不得污染它——
+    # 不落用户标记、不生成 AGENTS.stub.md、不建 packets/audit/snapshots。
+    # 校验逻辑唯一真相在 kernel.engine.verify_workspace_matches_flow（零写入纯查询）；
+    # 空账本 = 全新工作区，天然通过，故 run 仍可直接冷启动新工作区（不退 5）。
     prepare_ledger, prepare_state = _open_workspace_state(workspace)
     try:
+        verify_workspace_matches_flow(flow_ir, prepare_ledger)
+        workspace.mkdir(parents=True, exist_ok=True)
+        # 上轮等待点留在 todo.md 的勾选/@pause/@skip/@resume 先落账，再驱动内核
         apply_user_marks(flow_ir, workspace / "todo.md", prepare_ledger, prepare_state)
     finally:
         prepare_ledger.close()
@@ -211,14 +244,10 @@ def _handle_resume(parsed_args: argparse.Namespace) -> int:
         return EXIT_WORKSPACE_MISSING
     ledger, flow_state = _open_workspace_state(workspace)
     try:
-        if not _workspace_matches_flow(ledger, flow_ir):
-            print(
-                "flowrun: 工作区与流程身份不匹配"
-                f"（工作区账本 run={_ledger_run_name(ledger)!r}，"
-                f"流程 run={flow_ir.run_name!r}）",
-                file=sys.stderr,
-            )
-            return EXIT_WORKSPACE_MISMATCH
+        # 身份校验唯一真相在 kernel.engine.verify_workspace_matches_flow（零写入纯查询，
+        # 可直接在已打开的账本上调用），与 run 同口径：不仅比 run 名，同 run 名而节点集
+        # 被替换也拒绝。不符时由 main 统一捕获 FlowWorkspaceMismatchError（退 4）。
+        verify_workspace_matches_flow(flow_ir, ledger)
         if flow_state.is_halted():
             print("flowrun: 流已终止（halted），拒绝恢复", file=sys.stderr)
             return EXIT_WAITING
@@ -305,20 +334,6 @@ def _workspace_is_initialized(workspace: Path) -> bool:
     return _workspace_ledger_path(workspace).exists()
 
 
-def _ledger_run_name(ledger: EventLedger) -> str | None:
-    """账本中 flow_started 记录的 run 名（工作区身份的真相来源）；空账本为 None。"""
-    for entry in ledger.entries():
-        if entry.type == "flow_started":
-            return entry.run
-    return None
-
-
-def _workspace_matches_flow(ledger: EventLedger, flow_ir: FlowIR) -> bool:
-    """工作区身份（flow_started.run）与图 run_name 是否一致；空账本视为可写。"""
-    recorded_run_name = _ledger_run_name(ledger)
-    return recorded_run_name is None or recorded_run_name == flow_ir.run_name
-
-
 def _resolve_human_node(parsed_args: argparse.Namespace, decision: str) -> int:
     """approve/deny 共用装配：幂等校验 → 落 human_resolved → 重写 todo 投影。"""
     flow_ir = _compile_flow_file(Path(parsed_args.flow))
@@ -398,7 +413,10 @@ def _print_state_summary(
     if tripped_gates:
         print(f"已触发闸: {'、'.join(tripped_gates)}")
     if flow_state.is_paused():
-        print("提示: 流已暂停，运行 `flowrun resume` 或在该行加 @resume 恢复")
+        print(
+            "提示: 流已暂停，运行 `flowrun resume`，"
+            "或在待恢复节点行的行尾用 HTML 注释标记 @resume 恢复"
+        )
 
 
 if __name__ == "__main__":

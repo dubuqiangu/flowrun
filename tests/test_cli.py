@@ -2,7 +2,7 @@
 approve/deny 幂等与拒绝、status 摘要、todo 子命令（真子进程假 agent，零配置直跑）。
 
 退出码契约：0=done / 1=waiting / 2=halted / 3=编译失败 / 4=工作区身份不匹配 /
-5=工作区未初始化。
+5=工作区未初始化 / 6=账本损坏。
 
 直跑：python -m unittest discover -s tests
 """
@@ -25,6 +25,7 @@ for path_entry in (str(SOURCE_ROOT), str(TESTS_DIRECTORY)):
         sys.path.insert(0, path_entry)
 
 from flowrun.cli import main as cli_main  # noqa: E402
+from flowrun.state.ledger import EventLedger  # noqa: E402
 
 FIXTURES_DIRECTORY = TESTS_DIRECTORY / "fixtures"
 PYTHON_EXECUTABLE_POSIX = Path(sys.executable).as_posix()
@@ -248,11 +249,11 @@ class CliTestCase(unittest.TestCase):
             1,
         )
 
-        # 用 todo @pause 把流挂起（T002 此时 planned，可被暂停）
+        # 用 todo 行尾注释 @pause 把流挂起（T002 此时 planned，可被暂停）
         todo_path = self.workspace / "todo.md"
         todo_path.write_text(
             todo_path.read_text(encoding="utf-8").replace(
-                "- [ ] T002", "- [ ] T002 @pause"
+                "- [ ] T002", "- [ ] T002 <!-- @pause -->"
             ),
             encoding="utf-8",
         )
@@ -344,6 +345,113 @@ class CliTestCase(unittest.TestCase):
         )
         self.assertEqual(exit_code, 5)
         self.assertIn("工作区未初始化", stderr_text)
+
+    def test_resume_on_directory_without_ledger_exits_five(self) -> None:
+        """目录存在但缺账本 → 仍是"未初始化"退 5（不因走了内核校验而改口径）。"""
+        flow_path = self.test_root / "linear.mmd"
+        self.write_linear_flow(flow_path)
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(
+            ["resume", "--flow", str(flow_path), "--workspace", str(self.workspace)]
+        )
+        self.assertEqual(exit_code, 5)
+        self.assertIn("工作区未初始化", stderr_text)
+
+    def test_resume_same_run_name_with_appended_node_exits_four(self) -> None:
+        """回归点：同 run 名但图多一个节点 → resume 退 4（改前只比 run 名会放行）。"""
+        self.write_workspace_flow_started_ledger("cli-linear", ["T001", "T002"])
+        appended_flow = self.test_root / "appended.mmd"
+        appended_flow.write_text(
+            compose_flow_document(
+                "cli-linear",
+                {"fake-task": fake_agent_command_text("fake_delivery_agent.py")},
+                [
+                    "  T001[准备数据;;agent=fake-task;;out=data/input.txt] --> T002[生成报告;;agent=fake-task;;out=report/out.txt]",
+                    "  T002 --> T003[额外收尾;;agent=fake-task;;out=extra.txt]",
+                ],
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(
+            ["resume", "--flow", str(appended_flow), "--workspace", str(self.workspace)]
+        )
+        self.assertEqual(exit_code, 4)
+        self.assertIn("不匹配", stderr_text)
+        self.assertIn("T003", stderr_text, "诊断应指出多出来的节点")
+        self.assertNotIn(
+            "flow_resumed",
+            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8"),
+            "身份不符不得落 flow_resumed",
+        )
+
+    def test_resume_same_run_name_with_missing_node_exits_four(self) -> None:
+        """回归点：同 run 名但计划节点在当前图中消失 → resume 退 4。"""
+        self.write_workspace_flow_started_ledger("cli-linear", ["T001", "T002"])
+        reduced_flow = self.test_root / "reduced.mmd"
+        reduced_flow.write_text(
+            compose_flow_document(
+                "cli-linear",
+                {"fake-task": fake_agent_command_text("fake_delivery_agent.py")},
+                ["  T001[准备数据;;agent=fake-task;;out=data/input.txt]"],
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(
+            ["resume", "--flow", str(reduced_flow), "--workspace", str(self.workspace)]
+        )
+        self.assertEqual(exit_code, 4)
+        self.assertIn("不匹配", stderr_text)
+        self.assertIn("T002", stderr_text, "诊断应指出消失的节点")
+
+    def test_resume_equal_node_set_on_paused_flow_exits_zero(self) -> None:
+        """节点集相等 → 身份校验放行；暂停态 resume 正常返回 0 并落 flow_resumed。"""
+        flow_path = self.test_root / "gate_fail.mmd"
+        self.write_gate_fail_flow(flow_path)
+        self.assertEqual(
+            self.invoke_cli(["run", str(flow_path), "--workspace", str(self.workspace)])[0],
+            1,
+        )
+
+        exit_code, stdout_text, stderr_text = self.invoke_cli(
+            ["resume", "--flow", str(flow_path), "--workspace", str(self.workspace)]
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr_text, "")
+        self.assertIn("已恢复", stdout_text)
+        self.assertIn(
+            "flow_resumed",
+            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8"),
+        )
+
+    def test_resume_legacy_ledger_without_planned_nodes_checks_run_name_only(self) -> None:
+        """兼容边界：老账本 flow_started 无 planned_nodes → 只校验 run 名（防误伤）。
+
+        节点集与"计划"不同也不得拦（无 planned_nodes 可比），故身份校验放行后由
+        非暂停态退 1 —— 而非身份不匹配的 4。
+        """
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        try:
+            ledger.append(
+                "flow_started",
+                {"entry_nodes": ["T001"]},  # 老账本：无 planned_nodes
+                "cli-linear-flow-started",
+                "cli-linear",
+            )
+        finally:
+            ledger.close()
+
+        flow_path = self.test_root / "linear.mmd"
+        self.write_linear_flow(flow_path)  # 同 run 名 cli-linear，节点 T001/T002
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(
+            ["resume", "--flow", str(flow_path), "--workspace", str(self.workspace)]
+        )
+        self.assertEqual(exit_code, 1, "身份校验放行后由非暂停态退 1")
+        self.assertIn("未处于暂停状态", stderr_text)
+        self.assertNotIn("不匹配", stderr_text)
+
 
     # ---------------------------------------------------------------- status
 
@@ -468,6 +576,203 @@ class CliTestCase(unittest.TestCase):
             ["run", str(flow_path), "--workspace", str(self.workspace)]
         )
         self.assertEqual(resume_code, 0)
+
+    # ---------------------------------------------------------------- 账本损坏（退出码 6）
+
+    def corrupt_workspace_ledger_by_appending_garbage(self, flow_path: Path) -> int:
+        """先跑一次真流程产出合法账本，再追加一行垃圾制造中段损坏；返回合法行数。"""
+        self.invoke_cli(["run", str(flow_path), "--workspace", str(self.workspace)])
+        ledger_path = self.workspace / "ledger.jsonl"
+        valid_line_count = len(ledger_path.read_text(encoding="utf-8").splitlines())
+        with ledger_path.open("a", encoding="utf-8") as ledger_handle:
+            ledger_handle.write("{这不是一行合法的 ledger 条目\n")
+        return valid_line_count
+
+    def assert_ledger_corruption_reported(self, argv: list[str]) -> None:
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(argv)
+        self.assertEqual(exit_code, 6, f"{argv[0]} 应以退出码 6 报告账本损坏")
+        self.assertNotIn("Traceback", stderr_text, "账本损坏不得打 Python traceback")
+        self.assertIn("账本损坏", stderr_text)
+        self.assertIn("ledger.jsonl", stderr_text, "诊断必须指出是哪个账本文件")
+
+    def test_ledger_corruption_reports_exit_six_across_all_subcommands(self) -> None:
+        """回归点：账本中段损坏时 run/status/todo/resume/approve 一律退 6 且无 traceback。"""
+        flow_path = self.test_root / "human_gate.mmd"
+        self.write_human_gate_flow(flow_path)
+        self.corrupt_workspace_ledger_by_appending_garbage(flow_path)
+        workspace_text = str(self.workspace)
+        for argv in (
+            ["status", "--workspace", workspace_text, "--flow", str(flow_path)],
+            ["todo", "--workspace", workspace_text, "--flow", str(flow_path)],
+            ["resume", "--flow", str(flow_path), "--workspace", workspace_text],
+            ["approve", "H001", "--flow", str(flow_path), "--workspace", workspace_text],
+            ["run", str(flow_path), "--workspace", workspace_text],
+        ):
+            with self.subTest(subcommand=argv[0]):
+                self.assert_ledger_corruption_reported(argv)
+
+    def test_snapshot_integrity_failure_also_reports_exit_six(self) -> None:
+        """快照恢复路径的损坏信号与账本解析失败同型（LedgerCorruptionError → 退 6）。
+
+        快照点 head_hash 与账本重算哈希不符 ⇒ recover_flow_state 的防篡改核对
+        抛 LedgerCorruptionError（不是另一种异常）——故 main 的单一捕获即可覆盖。
+        """
+        flow_path = self.test_root / "linear.mmd"
+        self.write_linear_flow(flow_path)
+        self.invoke_cli(["run", str(flow_path), "--workspace", str(self.workspace)])
+        ledger_line_count = len(
+            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+        )
+        snapshots_directory = self.workspace / "snapshots"
+        snapshots_directory.mkdir(parents=True, exist_ok=True)
+        (snapshots_directory / f"snapshot_{ledger_line_count:010d}.json").write_text(
+            json.dumps(
+                {
+                    "seq": ledger_line_count,
+                    "head_hash": "0" * 64,  # 与账本真实哈希不符：伪造/损坏的快照
+                    "created_ts": 0,
+                    "state": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(
+            ["status", "--workspace", str(self.workspace)]
+        )
+        self.assertEqual(exit_code, 6)
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertIn("账本损坏", stderr_text)
+        self.assertIn("ledger.jsonl", stderr_text)
+
+    def test_snapshot_record_missing_state_reports_exit_six(self) -> None:
+        """形状非法（缺 state 键）的快照记录经 CLI 退 6，无 traceback 且含可读原因。
+
+        改前 recover_flow_state 直接 ``latest_record["state"]`` 抛裸 KeyError，
+        穿透 main() 打 traceback（违反退出码 6 契约）。
+        """
+        flow_path = self.test_root / "linear.mmd"
+        self.write_linear_flow(flow_path)
+        self.invoke_cli(["run", str(flow_path), "--workspace", str(self.workspace)])
+        ledger_line_count = len(
+            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+        )
+        snapshots_directory = self.workspace / "snapshots"
+        snapshots_directory.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshots_directory / f"snapshot_{ledger_line_count:010d}.json"
+        snapshot_path.write_text(
+            json.dumps(
+                {"seq": ledger_line_count, "head_hash": "", "created_ts": 0}  # 缺 state
+            ),
+            encoding="utf-8",
+        )
+
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(
+            ["status", "--workspace", str(self.workspace)]
+        )
+        self.assertEqual(exit_code, 6)
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertIn("账本损坏", stderr_text)
+        self.assertIn("快照记录形状非法", stderr_text)
+        self.assertIn(str(snapshot_path), stderr_text)
+
+
+    # ---------------------------------------------------------------- 身份校验先于写入
+
+    def write_workspace_flow_started_ledger(
+        self, run_name: str, planned_node_ids: list[str]
+    ) -> None:
+        """只落一条 flow_started 的干净工作区（无 stub / 无 packets·audit·snapshots）。"""
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        try:
+            ledger.append(
+                "flow_started",
+                {"entry_nodes": planned_node_ids[:1], "planned_nodes": planned_node_ids},
+                f"{run_name}-flow-started",
+                run_name,
+            )
+        finally:
+            ledger.close()
+
+    def assert_workspace_left_untouched(
+        self, exit_code: int, stderr_text: str, expected_ledger_line_count: int
+    ) -> None:
+        """身份不符的 run 不得在工作区留任何痕迹（账本 / stub / 内核目录）。"""
+        self.assertEqual(exit_code, 4)
+        self.assertIn("不匹配", stderr_text)
+        ledger_lines = (
+            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+        )
+        self.assertEqual(
+            len(ledger_lines),
+            expected_ledger_line_count,
+            "校验失败不得向工作区账本落任何事件",
+        )
+        self.assertFalse((self.workspace / "AGENTS.stub.md").exists())
+        for kernel_directory_name in ("audit", "packets", "snapshots"):
+            self.assertFalse(
+                (self.workspace / kernel_directory_name).exists(),
+                f"校验失败不得新建 {kernel_directory_name}/",
+            )
+
+    def test_run_with_foreign_run_name_leaves_workspace_untouched(self) -> None:
+        """回归点：拿 B 的流程跑 A 的工作区，退 4 且 A 的账本/stub/目录零变化。"""
+        foreign_flow = self.test_root / "human_gate.mmd"
+        self.write_human_gate_flow(foreign_flow)  # run 名 cli-human-gate
+        self.write_workspace_flow_started_ledger("cli-linear", ["T001", "T002"])
+        # 预置一份带用户标记的 todo.md：B 的流程若被推进，标记会被落成 run='cli-human-gate'
+        # 的 user_directive 污染 A 的账本（修复前的实际现象）。
+        todo_path = self.workspace / "todo.md"
+        user_todo_text = "- [ ] T002 <!-- @pause -->\n"
+        todo_path.write_text(user_todo_text, encoding="utf-8")
+
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(
+            ["run", str(foreign_flow), "--workspace", str(self.workspace)]
+        )
+        self.assert_workspace_left_untouched(
+            exit_code, stderr_text, expected_ledger_line_count=1
+        )
+        self.assertEqual(
+            todo_path.read_text(encoding="utf-8"),
+            user_todo_text,
+            "身份不符不得改写用户已有的 todo.md",
+        )
+
+    def test_run_with_appended_node_flow_leaves_workspace_untouched(self) -> None:
+        """回归点：同 run 名但图多一个节点（追加），退 4 且工作区零变化。"""
+        extended_flow = self.test_root / "linear_extended.mmd"
+        extended_flow.write_text(
+            compose_flow_document(
+                "cli-linear",
+                {"fake-task": fake_agent_command_text("fake_delivery_agent.py")},
+                [
+                    "  T001[准备数据;;agent=fake-task;;out=data/input.txt] --> T002[生成报告;;agent=fake-task;;out=report/out.txt]",
+                    "  T002 --> T003[额外收尾;;agent=fake-task;;out=extra.txt]",
+                ],
+            ),
+            encoding="utf-8",
+        )
+        self.write_workspace_flow_started_ledger("cli-linear", ["T001", "T002"])
+
+        exit_code, _stdout_text, stderr_text = self.invoke_cli(
+            ["run", str(extended_flow), "--workspace", str(self.workspace)]
+        )
+        self.assert_workspace_left_untouched(
+            exit_code, stderr_text, expected_ledger_line_count=1
+        )
+        self.assertFalse((self.workspace / "todo.md").exists())
+        self.assertIn("T003", stderr_text, "诊断应指出多出来的节点")
+
+    def test_run_still_cold_starts_on_empty_workspace(self) -> None:
+        """回归点：身份校验前移不得误伤冷启动（空账本/不存在的目录仍能跑）。"""
+        flow_path = self.test_root / "linear.mmd"
+        self.write_linear_flow(flow_path)
+        exit_code, _stdout_text, _stderr_text = self.invoke_cli(
+            ["run", str(flow_path), "--workspace", str(self.workspace)]
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertTrue((self.workspace / "AGENTS.stub.md").exists())
 
 
 if __name__ == "__main__":

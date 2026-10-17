@@ -19,7 +19,9 @@ spec-kit 模式（design.md §2.2 现场查证结论照抄）：一份命令模�
 """
 from __future__ import annotations
 
+import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -45,6 +47,15 @@ PACKET_PATH_PLACEHOLDER = "__FLOW_PACKET_PATH__"
 INJECTION_MODE_CONTENT = "content"
 INJECTION_MODE_PATH = "path"
 _INJECTION_MODES = (INJECTION_MODE_CONTENT, INJECTION_MODE_PATH)
+
+# win32 命令头解析与启动方式的扩展名知识（base.py 复用，避免两处各写一份）：
+# - 候选集用于 which 未命中时的有界兜底探测；
+# - 垫片（shim）是包管理器装的脚本包装器，CreateProcess 无法直接 exec，
+#   必须换一种启动方式（批处理经 cmd.exe，PowerShell 经 powershell -File）。
+WINDOWS_COMMAND_SUFFIX_CANDIDATES = (".exe", ".cmd", ".bat", ".ps1")
+WINDOWS_BATCH_SHIM_SUFFIXES = (".cmd", ".bat")
+WINDOWS_POWERSHELL_SHIM_SUFFIXES = (".ps1",)
+WINDOWS_SHIM_SUFFIXES = WINDOWS_BATCH_SHIM_SUFFIXES + WINDOWS_POWERSHELL_SHIM_SUFFIXES
 
 # 命令头（command[0]）→ 适配器类。内置项由 claude_code / opencode_cli
 # 模块级 @register_adapter 装饰器在导入时填充。键一律 casefold()：
@@ -142,14 +153,59 @@ def expand_command_template(
     return expanded_command
 
 
+def resolve_command_path(command_head: str) -> str | None:
+    """解析命令头 → 可执行文件路径（决定"能不能启动"的唯一入口）；解析不到返回 None。
+
+    第一轮 ``shutil.which``（POSIX 上就是全部逻辑，行为与本函数引入前一致）；
+    win32 上未命中时再按**显式扩展名候选集**与字面名探测一轮 —— 默认 PATHEXT
+    不含 ``.PS1``，只有 ``.ps1`` 垫片的 CLI（npm 全局安装常见）会被 which 漏掉，
+    于是 probe 报不可用、dispatch 报 WinError 2，两边都不说人话。
+    """
+    if not command_head:
+        return None
+    resolved_path = shutil.which(command_head)
+    if resolved_path is not None:
+        return resolved_path
+    if sys.platform != "win32":
+        return None
+    for candidate_name in _windows_command_candidate_names(command_head):
+        resolved_path = _search_path_entries_for_literal_name(candidate_name)
+        if resolved_path is not None:
+            return resolved_path
+    return None
+
+
+def _windows_command_candidate_names(command_head: str) -> list[str]:
+    """候选文件名：带扩展名的头只查字面名，裸名才追加扩展名候选集。"""
+    if Path(command_head).suffix:
+        return [command_head]
+    return [
+        command_head + candidate_suffix
+        for candidate_suffix in WINDOWS_COMMAND_SUFFIX_CANDIDATES
+    ]
+
+
+def _search_path_entries_for_literal_name(command_name: str) -> str | None:
+    """按 PATH 逐条查字面文件名（不追加任何扩展名）。
+
+    ``shutil.which`` 在目标扩展名不在 PATHEXT 里时连字面名都不查
+    （实测 ``which("x.ps1")`` 在默认 PATHEXT 下返回 None），只能自己补这一轮。
+    """
+    if os.path.dirname(command_name):
+        return command_name if os.path.isfile(command_name) else None
+    for path_entry in (os.environ.get("PATH") or "").split(os.pathsep):
+        candidate_path = os.path.join(path_entry, command_name) if path_entry else command_name
+        if os.path.isfile(candidate_path):
+            return candidate_path
+    return None
+
+
 def probe_available(agent_registry: dict[str, AgentCommandSpec]) -> dict[str, bool]:
-    """逐 agent 探测其命令头是否在 PATH 上（shutil.which）。"""
+    """逐 agent 探测其命令头是否在本机可解析（见 resolve_command_path）。"""
     availability: dict[str, bool] = {}
     for agent_name, agent_spec in agent_registry.items():
-        if not agent_spec.command:
-            availability[agent_name] = False
-            continue
-        availability[agent_name] = (
-            shutil.which(agent_spec.command[0]) is not None
+        availability[agent_name] = bool(
+            agent_spec.command
+            and resolve_command_path(agent_spec.command[0]) is not None
         )
     return availability

@@ -5,10 +5,12 @@
 ``recover_flow_state`` 恢复状态推进（快照 + 增量重放，与全量重放等价），
 因此同一工作区反复调用 run_flow 与一次连续执行语义一致（崩溃/暂停续跑）。
 
-进入主循环前做一次**工作区身份校验**（FIX-B3）：账本非空时，其 flow_started
-的 run 名与计划节点集合必须与当前 IR 相符，否则抛 ``FlowWorkspaceMismatchError``
-（CLI 捕获后退 4）——防止 ``flowrun run b.mmd --workspace a的工作区`` 恢复出
-A 的 flow_done 后立刻宣告完成、把 B 整图静默跳过。
+进入主循环前做一次**工作区身份校验**（FIX-B3 / K2，公开函数
+``verify_workspace_matches_flow``）：账本非空时，其 flow_started 的 run 名与
+计划节点集合必须与当前 IR **严格集合相等**（多出或缺失都拒绝），否则抛
+``FlowWorkspaceMismatchError``（CLI 捕获后退 4）——防止
+``flowrun run b.mmd --workspace a的工作区`` 恢复出 A 的 flow_done 后立刻宣告
+完成、把 B 整图静默跳过，也防止"新图追加节点"静默继承旧 run 的 done。
 
 主循环每轮（任务书 T010 冻结顺序；②③ 于 FIX-B2 换序）：
 ① 恢复 FlowState；running 节点视为上次进程中断 → 落 node_failed
@@ -23,9 +25,9 @@ A 的 flow_done 后立刻宣告完成、把 B 整图静默跳过。
    （见 engine_gates 模块 docstring）；
 ④ 推进 ready 节点（task 并发，见 engine_node_executors）；
 ⑤ finished 节点出边激活：done/skipped 的无条件边与 barrier 边 → edge_taken
-   （跨轮幂等：同 source→target 只激活一次；target 已是 done/skipped 的边
-   跳过不激活——**投影只前进不后退**，FIX-B1）；failed 节点按 engine_gates
-   的失败处置策略走超时分支 / 重新入队 / retry 闸；
+   （跨轮幂等：同 source→target 只激活一次；target 已是终态 done/skipped/failed
+   的边跳过且不落 edge_taken——**投影只前进不后退**，FIX-B1 + K3）；failed 节点
+   按 engine_gates 的失败处置策略走超时分支 / 重新入队（node_entered） / retry 闸；
 ⑥ 快照（默认 SnapshotStore.maybe_snapshot，可用 hook 替换）；
 ⑦ 收口：全部节点 done/skipped → flow_done；收口前再查一次闸，防最后一跳
    烧穿预算仍宣告完成；整轮零进展（如 join 等前驱）→ 挂起返回不空转。
@@ -48,6 +50,7 @@ from flowrun.state.flow_state import (
     STATUS_RUNNING,
     STATUS_SKIPPED,
     FlowState,
+    edge_taken_may_activate_target,
     is_finished_status,
 )
 from flowrun.state.ledger import EventLedger
@@ -61,7 +64,7 @@ from .engine_gates import (
     GateFinding,
     append_edge_taken,
     count_node_events,
-    find_machine_gate_trip,
+    find_untripped_machine_gates,
     has_edge_been_taken,
     outgoing_unconditional_targets,
     resolve_failed_node_policy,
@@ -70,7 +73,12 @@ from .engine_gates import (
 from .engine_node_executors import advance_ready_nodes
 from .todo_projection import write_todo
 
-__all__ = ["EngineHooks", "FlowWorkspaceMismatchError", "run_flow"]
+__all__ = [
+    "EngineHooks",
+    "FlowWorkspaceMismatchError",
+    "run_flow",
+    "verify_workspace_matches_flow",
+]
 
 
 class FlowWorkspaceMismatchError(Exception):
@@ -131,7 +139,7 @@ async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> 
         ledger.close()  # 关闭追加句柄（幂等）；读路径不受影响，Windows 下防文件锁
         return final_state
 
-    _verify_workspace_matches_flow(flow_ir, ledger)
+    verify_workspace_matches_flow(flow_ir, ledger)
 
     if ledger.last_seq == 0:
         ledger.append(
@@ -177,10 +185,13 @@ async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> 
         ):
             return finish()
 
-        # ③ 机器闸（hop / budget）：每工作区每闸名至多触发一次（FIX-B2）
-        gate_finding = find_machine_gate_trip(flow_ir, flow_state, ledger)
-        if gate_finding is not None:
-            trip_gate(ledger, run_name, gate_finding)
+        # ③ 机器闸（hop / budget）：每工作区每闸名至多触发一次（FIX-B2）。
+        #    K1：两个闸各自独立判定，未了结的命中**逐条**落账（trip_gate 自身按闸名幂等，
+        #    一个闸的豁免不会连坐另一个闸）。
+        machine_gate_findings = find_untripped_machine_gates(flow_ir, flow_state, ledger)
+        if machine_gate_findings:
+            for gate_finding in machine_gate_findings:
+                trip_gate(ledger, run_name, gate_finding)
             return finish()
 
         # ④ 推进 ready 节点（human_requested → 本轮挂起返回）
@@ -196,17 +207,19 @@ async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> 
         flow_state = recover_flow_state(ledger, snapshot_store)
         snapshot_action(ledger, flow_state)
 
-        # ⑦ 收口：全部 resolved → flow_done；闸复查防"最后一跳烧穿预算"
+        # ⑦ 收口：全部 resolved → flow_done；闸复查防"最后一跳烧穿预算"。
+        #    K1：与 ③ 同口径——未了结的机器闸逐条落账（hop / budget 互不遮蔽）。
         all_nodes_resolved = all(
-            flow_state.node_status(node_id) in (STATUS_DONE, STATUS_SKIPPED)
+            is_finished_status(flow_state.node_status(node_id))
             for node_id in flow_ir.nodes
         )
         if all_nodes_resolved:
-            final_gate_finding = find_machine_gate_trip(flow_ir, flow_state, ledger)
-            if final_gate_finding is None:
-                ledger.append("flow_done", {}, f"{run_name}-flow-done", run_name)
+            final_gate_findings = find_untripped_machine_gates(flow_ir, flow_state, ledger)
+            if final_gate_findings:
+                for gate_finding in final_gate_findings:
+                    trip_gate(ledger, run_name, gate_finding)
             else:
-                trip_gate(ledger, run_name, final_gate_finding)
+                ledger.append("flow_done", {}, f"{run_name}-flow-done", run_name)
             return finish()
         if ledger.last_seq == events_before_turn:
             # 零进展轮：无 ready/running/judging/awaiting/paused/failed 节点，
@@ -217,13 +230,26 @@ async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> 
             return finish()
 
 
-def _verify_workspace_matches_flow(flow_ir: FlowIR, ledger: EventLedger) -> None:
-    """工作区身份校验（FIX-B3）：不符抛 ``FlowWorkspaceMismatchError``。
+def verify_workspace_matches_flow(flow_ir: FlowIR, ledger: EventLedger) -> None:
+    """工作区身份校验（FIX-B3 / K2，冻结公开接口）：不符抛 ``FlowWorkspaceMismatchError``。
 
-    空账本 = 全新工作区，无需校验；账本非空时以其中 ``flow_started`` 为身份
-    真相来源：run 名必须一致，且工作区**已计划**的节点必须在当前图中存在
-    （允许图向后兼容地追加节点，但不允许工作区的既有节点凭空消失）。
-    账本非空却查不到 flow_started（异常账本）时不拦——交由后续恢复路径处置。
+    冻结接口（下一轮 cli.py 依赖）：函数名、参数顺序、抛出的异常类型都不再变更。
+
+    零写入纯查询：只读账本，不落事件、不建目录、不改文件；可直接在**已打开的**
+    ``EventLedger`` 上调用。
+
+    校验规则（用户裁定：**严格集合相等**）：
+    - 空账本 = 全新工作区，无需校验；
+    - 账本非空时以其中 ``flow_started`` 为身份真相来源：run 名必须一致，且其
+      ``planned_nodes`` 与当前图节点集必须**双向一致**——多出一个节点、或少了
+      一个节点都拒绝（"换图请换工作区"）。旧实现只拦"工作区既有节点消失"，
+      新图是超集时放行，叠加"已 done 的 run 直接返回"，会让追加进来的节点
+      静默继承旧 run 的 flow_done 而永不执行。
+
+    兼容边界（老账本 / 手写夹具）：``flow_started`` 的 payload **缺失或为空**
+    ``planned_nodes`` 时**跳过节点集校验**，只校验 run 名——否则既有夹具会被
+    全部打死。账本非空却查不到 ``flow_started``（异常账本）时不拦，交由后续
+    恢复路径处置。
     """
     flow_started_entry = next(
         (entry for entry in ledger.entries() if entry.type == "flow_started"), None
@@ -237,11 +263,20 @@ def _verify_workspace_matches_flow(flow_ir: FlowIR, ledger: EventLedger) -> None
             "（工作区不可跨流程复用：换图请换工作区）"
         )
     recorded_planned_nodes = set(flow_started_entry.payload.get("planned_nodes") or [])
-    missing_node_ids = recorded_planned_nodes - set(flow_ir.nodes)
-    if missing_node_ids:
+    if not recorded_planned_nodes:
+        return  # 兼容边界：无计划节点可校验，只认 run 名
+    current_node_ids = set(flow_ir.nodes)
+    replaced_node_ids = recorded_planned_nodes - current_node_ids
+    if replaced_node_ids:
         raise FlowWorkspaceMismatchError(
-            f"工作区 run '{flow_ir.run_name}' 的计划节点 {sorted(missing_node_ids)} "
-            f"不在当前流程图中——图已被整体替换"
+            f"工作区已有节点 {sorted(replaced_node_ids)} 不在当前图中——图已被替换"
+            "（工作区不可跨流程复用：换图请换工作区）"
+        )
+    appended_node_ids = current_node_ids - recorded_planned_nodes
+    if appended_node_ids:
+        raise FlowWorkspaceMismatchError(
+            f"当前图新增节点 {sorted(appended_node_ids)} 不在该工作区计划中"
+            "——追加节点请换工作区（工作区不可跨流程复用）"
         )
 
 
@@ -274,17 +309,20 @@ def activate_finished_nodes(
     skipped 节点视同 done 激活后继——"@skip 跳过该节点"意指绕过而非拦断
     全流（记事件不改图，design.md §5.1）。
 
-    FIX-B1 第②层守卫（**投影只前进不后退**）：target 已是 done/skipped 时
-    跳过该边激活且**不落 edge_taken**（边未被走，账本不得留下假事实）——
-    fan-in 错峰收尾时晚到的 barrier 边不得把已收口的节点重新点燃。
+    FIX-B1 + K3 第②层守卫（**投影只前进不后退**，单一真相 =
+    ``flow_state.edge_taken_may_activate_target``）：target 已是终态
+    （done / skipped / failed）时跳过该边激活且**不落 edge_taken**（边未被走，
+    账本不得留下假事实）——fan-in 错峰收尾时晚到的 barrier 边不得把已收口的
+    节点重新点燃；失败节点也不得被晚到入边退回 ready（它的重投只走
+    ``node_entered``，见 ``_apply_failure_policy``）。
     """
     run_name = flow_ir.run_name
     for node_id in flow_ir.nodes:
         node_status = flow_state.node_status(node_id)
         if node_status in (STATUS_DONE, STATUS_SKIPPED):
             for target_id, when_text in outgoing_unconditional_targets(flow_ir, node_id):
-                if is_finished_status(flow_state.node_status(target_id)):
-                    continue  # target 已收口：边不再激活（投影只前进不后退）
+                if not edge_taken_may_activate_target(flow_state.node_status(target_id)):
+                    continue  # target 已终态：边不再激活（投影只前进不后退）
                 if has_edge_been_taken(ledger, run_name, node_id, target_id):
                     continue
                 append_edge_taken(ledger, run_name, node_id, target_id, when_text)

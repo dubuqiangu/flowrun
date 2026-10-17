@@ -55,7 +55,7 @@ __all__ = [
     "FAILURE_ACTION_TRIP_GATE",
     "hop_limit",
     "check_cycle_gates",
-    "find_machine_gate_trip",
+    "find_untripped_machine_gates",
     "gate_has_been_settled",
     "append_gate_tripped",
     "trip_gate",
@@ -101,33 +101,43 @@ def hop_limit(flow_ir: FlowIR) -> int:
     return HOP_LIMIT_PER_NODE * len(flow_ir.nodes)
 
 
-def check_cycle_gates(flow_ir: FlowIR, flow_state: FlowState) -> GateFinding | None:
-    """检查每轮常开的机器闸（hop / budget）；未命中返回 None。
+def check_cycle_gates(flow_ir: FlowIR, flow_state: FlowState) -> list[GateFinding]:
+    """检查每轮常开的机器闸（hop / budget），返回**全部**命中的有序列表。
 
-    调用时机：主循环轮首（②）与收口前（⑦）——后者防"最后一跳烧穿预算
+    两个闸各自独立判定、互不遮蔽：hop 与 budget 可以同一轮同时命中，返回顺序
+    固定为 hop 先、budget 后；都不命中时返回空列表。
+
+    （修复 K1：旧实现用早退只返回一个命中闸，hop 优先会把 budget 永久遮蔽——
+    hop 一旦永久超限并被 resume 豁免，budget 超限就再也不会被看到。）
+
+    调用时机：主循环轮首（③）与收口前（⑦）——后者防"最后一跳烧穿预算
     仍宣告 flow_done"的窗口。
     """
-    limit = hop_limit(flow_ir)
-    if flow_state.hop_count() > limit:
-        return GateFinding(GATE_HOP, flow_state.hop_count(), limit)
-    if flow_state.token_spent() > flow_ir.budget_tokens:
-        return GateFinding(GATE_BUDGET, flow_state.token_spent(), flow_ir.budget_tokens)
-    return None
+    gate_findings: list[GateFinding] = []
+    hop_actual = flow_state.hop_count()
+    hop_ceiling = hop_limit(flow_ir)
+    if hop_actual > hop_ceiling:
+        gate_findings.append(GateFinding(GATE_HOP, hop_actual, hop_ceiling))
+    budget_actual = flow_state.token_spent()
+    if budget_actual > flow_ir.budget_tokens:
+        gate_findings.append(GateFinding(GATE_BUDGET, budget_actual, flow_ir.budget_tokens))
+    return gate_findings
 
 
-def find_machine_gate_trip(
+def find_untripped_machine_gates(
     flow_ir: FlowIR, flow_state: FlowState, ledger: EventLedger
-) -> GateFinding | None:
-    """机器闸（hop / budget）本轮是否该落账：阈值判定 + 一次性语义（FIX-B2）。
+) -> list[GateFinding]:
+    """机器闸（hop / budget）本轮该落账的命中列表（纯查询，不落账）。
 
-    先走 ``check_cycle_gates`` 的纯阈值判定；命中后还要过账本级的
-    "每工作区每闸名至多一次"（见 ``gate_has_been_settled``）——已了结的闸
-    （正等人审，或已被人审 resume 永久豁免）本轮不再触发。
+    先取 ``check_cycle_gates`` 的全部命中，再**逐个按闸名**过滤已了结者
+    （``gate_has_been_settled``：每工作区每闸名至多一次 + 其后有 flow_resumed
+    即永久豁免）。逐个过滤是关键——一个闸被人审豁免不得连坐另一个闸。
     """
-    gate_finding = check_cycle_gates(flow_ir, flow_state)
-    if gate_finding is None or gate_has_been_settled(ledger, gate_finding.gate):
-        return None
-    return gate_finding
+    return [
+        gate_finding
+        for gate_finding in check_cycle_gates(flow_ir, flow_state)
+        if not gate_has_been_settled(ledger, gate_finding.gate)
+    ]
 
 
 def gate_has_been_settled(ledger: EventLedger, gate_name: str) -> bool:

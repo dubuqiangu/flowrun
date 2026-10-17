@@ -14,6 +14,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from flowrun.state import ledger as ledger_module  # noqa: E402
 from flowrun.state.flow_state import STATUS_UNKNOWN  # noqa: E402
 from flowrun.state.ledger import (  # noqa: E402
     GENESIS_PREV_HASH,
@@ -347,6 +348,151 @@ class TestFlowStateProjection(LedgerTestCase):
         ledger.append("future_event_kind", {"anything": True}, "future-1", RUN_NAME, "T001")
         flow_state = ledger.replay()
         self.assertEqual(flow_state.node_status("T001"), "ready")  # 前向兼容：不崩、不改状态
+
+
+class TestEdgeActivationTerminalGuard(LedgerTestCase):
+    """K3：edge_taken 不得改写终态 target（done / failed / skipped）——投影层单一真相。"""
+
+    def test_edge_taken_does_not_revive_failed_target(self) -> None:
+        ledger = self.make_ledger()
+        ledger.append(
+            "flow_started",
+            {"entry_nodes": ["T001"], "planned_nodes": ["T001", "T002"]},
+            "run-start", RUN_NAME,
+        )
+        ledger.append("node_failed", {"exit_code": 3}, "T001-fail-1", RUN_NAME, "T001")
+        ledger.append(
+            "edge_taken", {"source": "T002", "target": "T001"}, "T002-edge-1", RUN_NAME, "T002"
+        )
+        self.assertEqual(ledger.replay().node_status("T001"), "failed")
+
+    def test_edge_taken_does_not_revive_done_or_skipped_target(self) -> None:
+        ledger = self.make_ledger()
+        ledger.append(
+            "flow_started",
+            {"entry_nodes": [], "planned_nodes": ["T001", "T002"]},
+            "run-start", RUN_NAME,
+        )
+        ledger.append("node_done", {"tokens": 0}, "T001-done-1", RUN_NAME, "T001")
+        ledger.append("user_directive", {"directive": "skip"}, "T002-skip-1", RUN_NAME, "T002")
+        ledger.append(
+            "edge_taken", {"source": "T003", "target": "T001"}, "T003-edge-1", RUN_NAME, "T003"
+        )
+        ledger.append(
+            "edge_taken", {"source": "T003", "target": "T002"}, "T003-edge-2", RUN_NAME, "T003"
+        )
+        replay_state = ledger.replay()
+        self.assertEqual(replay_state.node_status("T001"), "done")
+        self.assertEqual(replay_state.node_status("T002"), "skipped")
+
+    def test_edge_taken_still_activates_planned_target(self) -> None:
+        """正向对照：非终态 target 仍须被 edge_taken 置为 ready（守卫不能过宽）。"""
+        ledger = self.make_ledger()
+        ledger.append(
+            "flow_started",
+            {"entry_nodes": ["T001"], "planned_nodes": ["T001", "T002"]},
+            "run-start", RUN_NAME,
+        )
+        ledger.append(
+            "edge_taken", {"source": "T001", "target": "T002"}, "T001-edge-1", RUN_NAME, "T001"
+        )
+        self.assertEqual(ledger.replay().node_status("T002"), "ready")
+
+
+class TestIncrementalChainVerification(LedgerTestCase):
+    """K5：链校验必须增量——已确认前缀不再重复读盘/重算哈希，只校验新增条目。"""
+
+    def append_raw_record(self, record: dict) -> None:
+        with open(self.ledger_path, "ab") as append_handle:
+            append_handle.write((canonical_json(record) + "\n").encode("utf-8"))
+
+    def count_entry_hash_calls(self, invoke) -> int:
+        call_counter = {"count": 0}
+        original_compute_entry_hash = ledger_module.compute_entry_hash
+
+        def counting_compute_entry_hash(entry):
+            call_counter["count"] += 1
+            return original_compute_entry_hash(entry)
+
+        ledger_module.compute_entry_hash = counting_compute_entry_hash
+        try:
+            invoke()
+        finally:
+            ledger_module.compute_entry_hash = original_compute_entry_hash
+        return call_counter["count"]
+
+    def test_repeated_verify_stays_true_across_incremental_appends(self) -> None:
+        ledger = self.make_ledger()
+        append_sample_events(ledger, 3)
+        self.assertTrue(ledger.verify_chain())
+        append_sample_events(ledger, 3, first_event_index=3)
+        self.assertTrue(ledger.verify_chain())
+        self.assertTrue(ledger.verify_chain())
+
+    def test_incremental_verify_only_rehashes_new_entries(self) -> None:
+        ledger = self.make_ledger()
+        append_sample_events(ledger, 4)
+        self.assertTrue(ledger.verify_chain())
+        append_sample_events(ledger, 2, first_event_index=4)
+
+        hash_call_count = self.count_entry_hash_calls(
+            lambda: self.assertTrue(ledger.verify_chain())
+        )
+
+        self.assertEqual(
+            hash_call_count, 2, "增量校验只应重算新增条目的哈希（前缀不得重复读盘）"
+        )
+
+    def test_incremental_verify_detects_broken_link_in_new_entries(self) -> None:
+        ledger = self.make_ledger()
+        append_sample_events(ledger, 3)
+        self.assertTrue(ledger.verify_chain())
+        tampered_record = ledger.entries()[-1].to_dict()
+        tampered_record["seq"] = 4
+        tampered_record["prev_hash"] = "f" * 64
+        tampered_record["idem"] = "tampered-4"
+        self.append_raw_record(tampered_record)
+        self.assertFalse(ledger.verify_chain())
+
+    def test_incremental_verify_detects_seq_gap_in_new_entries(self) -> None:
+        ledger = self.make_ledger()
+        append_sample_events(ledger, 3)
+        self.assertTrue(ledger.verify_chain())
+        last_entry = ledger.entries()[-1]
+        gap_record = last_entry.to_dict()
+        gap_record["seq"] = 5  # seq 4 缺失
+        gap_record["prev_hash"] = compute_entry_hash(last_entry)
+        gap_record["idem"] = "gap-5"
+        self.append_raw_record(gap_record)
+        self.assertFalse(ledger.verify_chain())
+
+    def test_incremental_verify_detects_corrupt_line_in_new_entries(self) -> None:
+        ledger = self.make_ledger()
+        append_sample_events(ledger, 3)
+        self.assertTrue(ledger.verify_chain())
+        with open(self.ledger_path, "ab") as append_handle:
+            append_handle.write(b"<<< not json >>>\n")
+        self.assertFalse(ledger.verify_chain())
+
+    def test_verify_falls_back_to_full_scan_when_file_is_truncated(self) -> None:
+        """文件比上次校验时更短（被截断/重写）→ 必须回退到从头全量校验。"""
+        ledger = self.make_ledger()
+        append_sample_events(ledger, 5)
+        self.assertTrue(ledger.verify_chain())
+        raw_lines = self.ledger_path.read_bytes().split(b"\n")
+        tampered_record = ledger.entries()[1].to_dict()  # seq=2：其后还有条目，链能发现
+        tampered_record["payload"]["tokens"] = 999999
+        raw_lines[1] = canonical_json(tampered_record).encode("utf-8")
+        self.ledger_path.write_bytes(b"\n".join(raw_lines[:4]))  # 截断到更短
+        self.assertFalse(ledger.verify_chain())
+
+    def test_tampering_before_first_verify_is_still_detected(self) -> None:
+        ledger = self.make_ledger()
+        append_sample_events(ledger, 3)
+        tampered_record = ledger.entries()[1].to_dict()
+        tampered_record["payload"]["tokens"] = 999999
+        self.rewrite_line(1, tampered_record)
+        self.assertFalse(ledger.verify_chain())
 
 
 if __name__ == "__main__":

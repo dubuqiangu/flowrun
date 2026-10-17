@@ -140,7 +140,7 @@ agents:
 | `retry: N` | 失败重试 N 次，耗尽转人审 |
 | `timeout: 30m` | 该边为超时分支——`when=None` 的无条件边 + 定时器门控：判定器不评估它，定时器先到即走此边 |
 
-**`out=` 产物契约规则**（M1 定稿）：**声明了但列表为空 → 编译报错**——**例外**：带 `when: all` barrier 的 join 型 task 节点豁免（它天然无产物，如样例 J001）；**未声明 → 允许**（发布/诊断类节点本就无文件产物）。声明了 `out=` 的任务节点，判定器逐项核对存在性，缺项即 fail。**路径约束（M1）**：每个 `out=` 项必须是相对路径、不含 `..` 段、非绝对路径（含盘符），违者编译报错——防止契约被 workspace 之外的文件"满足"。
+**`out=` 产物契约规则**（M1 定稿）：**声明了但列表为空 → 编译报错**——**例外**：带 `when: all` barrier 的 join 型 task 节点豁免（它天然无产物，如样例 J001）；**未声明 → 允许**（发布/诊断类节点本就无文件产物）。声明了 `out=` 的任务节点，判定器逐项核对存在性，缺项即 fail。**路径约束（M1）**：每个 `out=` 项必须是相对路径、不含 `..` 段、非绝对路径（含盘符），违者编译报错——防止契约被 workspace 之外的文件"满足"。**根相对路径（`\x`、`/x`、`\Windows\win.ini`）一并拒绝**——它 `is_absolute()` 为 False、`.drive` 为空，但带盘根 `.root`，`workspace / 该路径` 会落到盘根而非工作区；UNC（`\\server\share`）与本类形制同拒。（NTFS ADS 形式 `a.txt:stream` 本轮未拦，见 tasks.md 台账。）
 
 **frontmatter 必填键**（M1 定稿）：`run` 与 `defaults.agent` 必填（缺失编译报错）；`budget_tokens` 可缺省（默认 1,000,000）。
 
@@ -170,12 +170,15 @@ flowchart TD
 - [x] T001 实现登录API          <!-- done -->
 - [ ] T002 实现登录UI
 - [ ] H001 发布人审   ← 此行可勾选
-<!-- 用户可用行尾标记：@pause @skip @resume -->
-<!-- 流被闸/暂停时此处会出现：FLOW PAUSED: gate=hop actual=… limit=… — 运行 flowrun resume 或加 @resume 恢复 -->
+<!-- 用户指令写成节点行行尾的 HTML 注释：@pause（挂起此处）@skip（跳过该节点）@resume（恢复整条流） -->
+<!-- 流被闸/暂停时此处会出现：FLOW PAUSED: gate=hop actual=… limit=… — 运行 flowrun resume 恢复，或在节点行行尾用 HTML 注释标记 @resume -->
 ```
 
 - 勾选状态**只来自** ledger 的 `node_done` / `human_resolved` 事件。
-- 用户合法操作仅四种：**勾选（仅人审节点行生效）、`@pause`（暂停流）、`@skip`（跳过该节点，该行保留但不勾选）、`@resume`（解除暂停——人审对已触发闸的显式豁免）**。
+- 用户合法操作仅四种：**勾选（仅人审节点行生效）、`<!-- @pause -->`（暂停流）、`<!-- @skip -->`（跳过该节点，该行保留但不勾选）、`<!-- @resume -->`（解除暂停——人审对已触发闸的显式豁免）**。
+- **指令标记语法 v2**：只有**行尾 HTML 注释**形式生效（注释内外允许空白）；节点 label 文本里的裸 `@pause`/`@skip`/`@resume` **永不触发**——label 是流程作者写的自由文本，是数据不是指令。旧式裸标记**已失效**；解析到节点行上的裸标记时给出**每轮每文件至多一条**的升级告警（防静默失效）。
+- **`@resume` 是全局标记**：仅当流确为暂停态才落 `flow_resumed{by:"todo"}`，否则告警忽略。
+- 生成的头/横幅注释**不得出现嵌套 HTML 注释**（Markdown 会提前闭合）。
 - 增删节点行 = 内核忽略并告警。todo 是**输入信号**，落账后才生效——**不做双向同步**（双向同步是状态发散的经典死法）。
 
 ### 4.3 packet.md（任务包：给 agent 喂什么）
@@ -220,6 +223,7 @@ budget_tokens: 200000
 
 - `idem` 幂等键 = run + node + type + attempt，重放去重；`prev_hash` 为前条哈希。
 - 快照每 N=20 事件落 `snapshots/`，恢复 = 快照 + 重放增量。
+- **恢复增量化（M1 优化，磁盘格式不变、恢复等价性不变）**：账本链校验只校验**新增条目**——本实例已确认的前缀不重复读盘/重算哈希（文件比上次校验点更短即回退全量，新实例首次调用永远全量）；最新快照记录做**进程内缓存** + 低成本失效判据。新增 / 快照 / 中断恢复三种路径与全量重放仍等价。已知盲区：同进程内"原地改写已确认前缀"增量路径察觉不到（跨实例首次仍走全量、可检出）。
 
 ### 4.5 交互图定位（决议）
 
@@ -236,11 +240,15 @@ planned → ready → running → judging → done | failed | awaiting_human
                        横向修饰态：paused / skipped（用户指令，只记事件不改图）
 ```
 
+- **边缘激活投影只前进不后退**：`edge_taken` 不得把处于**终态（done / skipped / failed）**的 target 改写为 ready；内核 ⑤ 层遇到这种 target 时**跳过该边且不落 `edge_taken`**（账本不留假事实，防"done→ready 回退 + 重复投递"）。
+- **两个判定分工要写清**："整图是否收口完成"用 **done/skipped**（`failed` 不算完成）；"边缘激活能否改写 target"用 **done/skipped/failed**。
+- 失败节点的重投**只能**经失败处置策略显式落的 `node_entered`（retry 重排队）；超时分支边仍照常激活分支目标。
+
 ### 5.2 谓词判定调用约定
 
 判定节点 D 的所有出边谓词 + 证据包（契约核对结果、diff、agent 自报）→ 判定 LLM（温度 0，JSON Schema 强约束）→ `{"edge":"D001->H001","confidence":0.9,"evidence":[...]}`。**edge 口径（M1 实况）**：投给判定的协议取值域是**命中边的编号**（`{source}->{target}`，见 packet_builder / AGENTS.stub）；引擎落账的 `verdict.payload.edge` 写的是**命中边的目标节点 id**（`engine_node_executors.py` 取 `chosen_edge_target`）。命中边表即转移；未命中或 confidence < 0.6 → 重试 1 次 → 仍败 → `gate_tripped` 转人审。同目标多入边时落账无法区分走的是哪条边——统一为边编号是 M2 待办（T020l）。
 
-### 5.3 闸（v2 修订：从 hard halt 降级为"转人审"；M1 定稿为"等待点优先 + 每闸至多一次 + 人审可豁免"）
+### 5.3 闸（v2 修订：从 hard halt 降级为"转人审"；M1 定稿为"等待点优先 + 每工作区每闸名至多一次 + 人审可豁免 + hop/budget 独立判定"）
 
 设计面三道闸：
 
@@ -254,8 +262,9 @@ planned → ready → running → judging → done | failed | awaiting_human
 
 **M1 语义定稿（消除"闸后死锁"，`engine_gates.py` 为唯一实现源）**：
 1. **等待点先于机器闸**：每次 run 先查 `is_paused / is_halted / is_done / awaiting_human`，已暂停的流再 run **零新事件**（既不重复落 `gate_tripped`，也不推进）。
-2. **每闸至多一次**：账本中同名 `gate_tripped` 已存在即视为"已了结"，不再重复触发。
-3. **`flow_resumed` = 人审对既有超限的永久豁免**：该事件（`flowrun resume` 或 todo 行尾 `@resume` 落账）之后，该闸不再触发，流程继续推进。超限事实仍留在账本里——豁免是一条**显式人审事实**，不是抹除。
+2. **每工作区每闸名至多一次**：账本中同名 `gate_tripped` 已存在即视为"该闸已了结"，不再重复触发。
+3. **`hop` 与 `budget` 各自独立判定**：同一轮可同时命中并**逐条各自落 `gate_tripped`**；"每闸名至多一次 + 其后有 `flow_resumed` 即永久豁免"按**闸名分别判定**——**一个闸被人审豁免不得连坐另一个闸**。收口前（⑦）对机器闸的复查与轮首（③）**同口径**（各自独立、互不遮蔽）。
+4. **`flow_resumed` = 人审对既有超限的永久豁免**：该事件（`flowrun resume` 或 todo 行尾 `<!-- @resume -->` 落账）之后，该闸不再触发，流程继续推进。超限事实仍留在账本里——豁免是一条**显式人审事实**，不是抹除。
 
 人审是最后一道闸，机器闸只负责"叫人"。**注入防御**：节点产物只进结构化抽取器（verdict/artifact 路径），永不被当作指令执行。
 
@@ -263,7 +272,16 @@ planned → ready → running → judging → done | failed | awaiting_human
 
 - **主体是人**；内核是唯一闸门持有者与审批状态写入者（真相只在 ledger）。
 - **强制人审点**：显式 `H([ ])` 节点、三闸触发、retry 耗尽。
-- **双通道同一事件 schema**：ACP agent 的 `request_permission`/`elicitation` 映射为 `human_requested/human_resolved`；文件契约 agent 走 todo 勾选/`@pause`。内核不区分来源。
+- **双通道同一事件 schema**：ACP agent 的 `request_permission`/`elicitation` 映射为 `human_requested/human_resolved`；文件契约 agent 走 todo 勾选 / `<!-- @pause -->`。内核不区分来源。
+
+### 5.5 工作区身份校验（用户裁定：严格集合相等）
+
+工作区与流程的绑定**不可跨流程复用**——"换图请换工作区"。判据与边界（`kernel/engine.py::verify_workspace_matches_flow`）：
+
+- 以账本 `flow_started` 为**身份真相源**：其 `planned_nodes` 与当前图节点集必须**严格集合相等**，**多一个或少一个都拒绝**。
+- `planned_nodes` **缺失或为空**时降级为**只校验 run 名**（兼容老账本 / 手写夹具）；**空账本 = 全新工作区**不校验；账本非空但查不到 `flow_started`（异常账本）时不拦。
+- 该校验**零写入**：只读账本，不落事件、不建目录、不改文件；且在**任何写入之前**执行——不得先落用户标记、不得先写 `AGENTS.stub.md`、不得先建目录。
+- **`run` 与 `resume` 统一使用同一套校验**；不符 → 退出码 `4`（`FlowWorkspaceMismatchError`）。
 
 ---
 

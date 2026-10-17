@@ -196,6 +196,104 @@ class TestRecovery(SnapshotTestCase):
         with self.assertRaises(LedgerCorruptionError):
             recover_flow_state(EventLedger(self.ledger_path), snapshot_store)
 
+    def write_snapshot_at_seq(self, snapshot_seq: int, snapshot_record: dict) -> Path:
+        """用给定记录覆盖/写入 seq 对应的快照文件，返回其路径。"""
+        snapshot_path = self.snapshot_dir / f"snapshot_{snapshot_seq:010d}.json"
+        snapshot_path.write_text(
+            json.dumps(snapshot_record), encoding="utf-8"
+        )
+        return snapshot_path
+
+    def test_snapshot_record_missing_state_is_ledger_corruption(self) -> None:
+        """可解析但缺 state 键的快照记录必须抛 LedgerCorruptionError，而非裸 KeyError。"""
+        ledger = self.make_ledger()
+        snapshot_store = self.make_store(every_n_events=5)
+        self.run_events_with_snapshots(ledger, snapshot_store, FlowState(), 5)
+        snapshot_path = self.write_snapshot_at_seq(
+            5, {"seq": 5, "head_hash": "", "created_ts": 0}  # 缺 state 键
+        )
+        with self.assertRaises(LedgerCorruptionError) as raised_context:
+            recover_flow_state(ledger, snapshot_store)
+        message_text = str(raised_context.exception)
+        self.assertIn("快照记录形状非法", message_text)
+        self.assertIn(str(snapshot_path), message_text)
+        self.assertIn("5", message_text)
+
+    def test_snapshot_record_non_dict_state_is_ledger_corruption(self) -> None:
+        """state 存在但非 dict 同样归入账本损坏，不是后续的解包 TypeError。"""
+        ledger = self.make_ledger()
+        snapshot_store = self.make_store(every_n_events=5)
+        self.run_events_with_snapshots(ledger, snapshot_store, FlowState(), 5)
+        snapshot_path = self.write_snapshot_at_seq(
+            5, {"seq": 5, "head_hash": "", "created_ts": 0, "state": ["不是对象"]}
+        )
+        with self.assertRaises(LedgerCorruptionError) as raised_context:
+            recover_flow_state(ledger, snapshot_store)
+        message_text = str(raised_context.exception)
+        self.assertIn("快照记录形状非法", message_text)
+        self.assertIn(str(snapshot_path), message_text)
+
+
+
+class TestRecoveryHotPathEquivalence(SnapshotTestCase):
+    """K5：恢复热路径（增量链校验 + 快照缓存）不得改变恢复语义，也不得被缓存固化。"""
+
+    def test_repeated_recovery_matches_full_replay_across_cache_hits(self) -> None:
+        ledger = self.make_ledger()
+        snapshot_store = self.make_store(every_n_events=5)
+        self.run_events_with_snapshots(ledger, snapshot_store, FlowState(), 16)
+
+        self.assertEqual(recover_flow_state(ledger, snapshot_store), ledger.replay())
+        for _repeat in range(5):
+            self.assertEqual(
+                recover_flow_state(ledger, snapshot_store),
+                ledger.replay(),
+                "重复恢复（命中缓存 / 增量链校验）结果必须恒等于全量重放",
+            )
+
+        ledger.append("node_done", {"tokens": 111}, "late-done-1", RUN_NAME, "H001")
+        self.assertEqual(
+            recover_flow_state(ledger, snapshot_store),
+            ledger.replay(),
+            "追加新事件后恢复必须反映新事件（缓存与增量校验游标都要失效）",
+        )
+
+    def test_snapshot_cache_is_not_used_before_it_is_warm(self) -> None:
+        ledger = self.make_ledger()
+        snapshot_store = self.make_store(every_n_events=5)
+        self.run_events_with_snapshots(ledger, snapshot_store, FlowState(), 7)
+
+        fresh_store = self.make_store(every_n_events=5)
+        self.assertEqual(snapshot_store.load_latest(), fresh_store.load_latest())
+
+    def test_latest_record_cache_avoids_rescan_until_directory_changes(self) -> None:
+        ledger = self.make_ledger()
+        snapshot_store = self.make_store(every_n_events=5)
+        self.run_events_with_snapshots(ledger, snapshot_store, FlowState(), 5)
+
+        scan_counter = {"count": 0}
+        original_scan = snapshot_store._scan_latest_record
+
+        def counting_scan():
+            scan_counter["count"] += 1
+            return original_scan()
+
+        snapshot_store._scan_latest_record = counting_scan
+
+        self.assertEqual(snapshot_store.load_latest()[1], 5)
+        self.assertEqual(snapshot_store.load_latest()[1], 5)
+        self.assertEqual(
+            scan_counter["count"], 1, "快照目录未变化时不得重复扫描/解析全部快照文件"
+        )
+
+        self.run_events_with_snapshots(
+            ledger, snapshot_store, FlowState(), 5, first_event_index=5
+        )
+        self.assertEqual(snapshot_store.load_latest()[1], 10)
+        self.assertEqual(
+            scan_counter["count"], 2, "新快照落盘后缓存必须失效并重新扫描"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

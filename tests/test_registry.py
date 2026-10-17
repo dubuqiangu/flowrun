@@ -1,4 +1,6 @@
 """registry.py 测试（T006）：which 探测 + 占位符展开 + 声明式注册 + AgentCommandSpec。"""
+import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -18,6 +20,7 @@ from flowrun.adapters.registry import (  # noqa: E402
     probe_available,
     register_adapter,
     resolve_adapter_class,
+    resolve_command_path,
 )
 
 PACKET_TEXT = "任务包正文：实现登录 API。"
@@ -180,6 +183,46 @@ class DeclarativeRegistrationTest(unittest.TestCase):
 
     def test_empty_command_returns_none(self):
         self.assertIsNone(create_adapter_for_command([]))
+
+
+class WindowsPathEntryResolutionTest(unittest.TestCase):
+    """C3：探测与启动必须用同一条解析路径（.ps1-only 垫片不再报"不可用"）。
+
+    回归目标：PATHEXT 默认不含 ``.PS1``，``shutil.which("x")`` 因此漏掉
+    ``x.ps1``；旧实现在这里报 probe False、dispatch WinError 2。现在
+    ``resolve_command_path`` 与 ``probe_available`` 共享同一解析，结论一致。
+    """
+
+    @unittest.skipUnless(sys.platform == "win32", "win32 专属的命令头解析行为")
+    def test_ps1_only_head_is_resolvable_and_probes_available_without_pathext_entry(self):
+        with tempfile.TemporaryDirectory(prefix="flowrun-c3-ps1-") as temp_dir_name:
+            ps1_path = Path(temp_dir_name) / "flowrun_c3_ps_only_agent.ps1"
+            ps1_path.write_text("Write-Output ok\n", encoding="ascii")
+            saved_path = os.environ.get("PATH")
+            saved_pathext = os.environ.get("PATHEXT")
+            # PATHEXT 明确不含 .PS1：which 看不到，只有字面名兜底探测能找到。
+            os.environ["PATH"] = temp_dir_name
+            os.environ["PATHEXT"] = ".COM;.EXE;.CMD"
+            try:
+                self.assertIsNone(
+                    shutil.which("flowrun_c3_ps_only_agent"),
+                    "前置条件：PATHEXT 不含 .PS1 时 which 必须漏掉该命令",
+                )
+                self.assertEqual(
+                    resolve_command_path("flowrun_c3_ps_only_agent"), str(ps1_path)
+                )
+                agent_registry = {"ps-agent": AgentCommandSpec(
+                    command=["flowrun_c3_ps_only_agent"], resume_mode=None)}
+                self.assertEqual(probe_available(agent_registry), {"ps-agent": True})
+            finally:
+                if saved_path is None:
+                    os.environ.pop("PATH", None)
+                else:
+                    os.environ["PATH"] = saved_path
+                if saved_pathext is None:
+                    os.environ.pop("PATHEXT", None)
+                else:
+                    os.environ["PATHEXT"] = saved_pathext
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 _SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_ROOT) not in sys.path:
@@ -123,6 +124,32 @@ class DispatchResultShapeTest(unittest.TestCase):
             stdout_path=Path("b.log"), duration_seconds=1.0,
         )
         self.assertEqual(second_result.structured_result, {})
+
+
+class NonWindowsLaunchPassthroughTest(unittest.TestCase):
+    """C2 边界：非 win32 分支必须原样透传 argv（行为与引入启动计划前逐字节一致）。
+
+    回归目标：启动计划重构若把"解析不到命令头就抛错"写成无条件分支，
+    POSIX 上原本交给 CreateProcess/execvp 的原样 argv 就会变成异常。
+    """
+
+    def _plan_with_platform(self, platform_name: str, command: list[str]):
+        from flowrun.adapters.base import plan_windows_command_launch
+
+        with mock.patch("flowrun.adapters.base.sys.platform", platform_name):
+            return plan_windows_command_launch(command)
+
+    def test_posix_unresolvable_head_is_passed_through_without_rewrite(self):
+        command = ["flowrun-definitely-missing-cli", "run", "arg with space"]
+        launch_plan = self._plan_with_platform("linux", command)
+        self.assertIsNone(launch_plan.shell_command_line)
+        self.assertEqual(list(launch_plan.exec_arguments), command)
+
+    def test_posix_existing_executable_is_passed_through_unchanged(self):
+        command = [sys.executable, "-c", "print('hi')"]
+        launch_plan = self._plan_with_platform("darwin", command)
+        self.assertIsNone(launch_plan.shell_command_line)
+        self.assertEqual(list(launch_plan.exec_arguments), command)
 
 
 if __name__ == "__main__":

@@ -183,6 +183,109 @@ class GateExemptionTestCase(unittest.TestCase):
             len(self.gate_events_named("budget")), 1, "豁免后的闸不得再次落账"
         )
 
+    # ---------------------------------------------------------------- K1 机器闸互不遮蔽
+
+    def seed_over_limit_ledger(
+        self,
+        flow_ir,
+        *,
+        hop_dispatches: int,
+        tokens: int,
+        tripped_gates: tuple[str, ...] = (),
+        resumed: bool = False,
+    ) -> None:
+        """手工播种到"已超限"状态：hop 计数由 agent_dispatched 现算，token 由 node_done 现算。"""
+        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger.append(
+            "flow_started",
+            {
+                "entry_nodes": list(flow_ir.entry_node_ids),
+                "planned_nodes": list(flow_ir.nodes),
+            },
+            f"{flow_ir.run_name}-flow-started",
+            flow_ir.run_name,
+        )
+        single_task_id = next(iter(flow_ir.nodes))
+        for attempt in range(1, hop_dispatches + 1):
+            seeded_ledger.append(
+                "agent_dispatched",
+                {"attempt": attempt},
+                f"{flow_ir.run_name}-{single_task_id}-agent-dispatched-{attempt}",
+                flow_ir.run_name,
+                single_task_id,
+            )
+        seeded_ledger.append(
+            "node_done",
+            {"tokens": tokens, "attempt": hop_dispatches},
+            f"{flow_ir.run_name}-{single_task_id}-node-done-{hop_dispatches}",
+            flow_ir.run_name,
+            single_task_id,
+        )
+        for gate_name in tripped_gates:
+            seeded_ledger.append(
+                "gate_tripped",
+                {"gate": gate_name, "actual": 1, "limit": 0},
+                f"{flow_ir.run_name}-gate-{gate_name}-1",
+                flow_ir.run_name,
+            )
+        if resumed:
+            seeded_ledger.append(
+                "flow_resumed", {}, f"{flow_ir.run_name}-flow-resumed-1", flow_ir.run_name
+            )
+        seeded_ledger.close()
+
+    def test_budget_gate_trips_even_when_hop_gate_already_settled(self) -> None:
+        """K1 复现：hop 永久超限且已被人审 resume 豁免时，budget 超限仍必须落账。
+
+        修复前 check_cycle_gates 早退只返回 hop（hop 优先），hop 一旦了结就让
+        budget 永久被遮蔽——预算闸形同不存在。"""
+        flow_ir = support.make_flow_ir(
+            [support.make_node("T001")], [], budget_tokens=50
+        )
+        self.seed_over_limit_ledger(
+            flow_ir, hop_dispatches=5, tokens=900, tripped_gates=("hop",), resumed=True
+        )
+
+        final_state = self.run_flow_once(flow_ir)
+
+        self.assertIn("budget", final_state.tripped_gates())
+        budget_events = self.gate_events_named("budget")
+        self.assertEqual(len(budget_events), 1)
+        self.assertEqual(budget_events[0].payload["limit"], 50)
+        self.assertEqual(
+            len(self.gate_events_named("hop")), 1, "已了结的 hop 闸不得被重复落账"
+        )
+
+    def test_hop_and_budget_gates_both_trip_in_same_round(self) -> None:
+        """K1：hop 与 budget 同一轮同时超限 → 两条闸都落账（互不遮蔽）。"""
+        flow_ir = support.make_flow_ir(
+            [support.make_node("T001")], [], budget_tokens=50
+        )
+        self.seed_over_limit_ledger(flow_ir, hop_dispatches=5, tokens=900)
+
+        final_state = self.run_flow_once(flow_ir)
+
+        self.assertEqual(final_state.tripped_gates(), ("hop", "budget"))
+        self.assertEqual(len(self.gate_events_named("hop")), 1)
+        self.assertEqual(len(self.gate_events_named("budget")), 1)
+
+    def test_settled_budget_gate_is_not_re_tripped(self) -> None:
+        """K1 一次性语义不变：budget 已了结（且已 resume 豁免）→ 不再落账，流程收口。"""
+        flow_ir = support.make_flow_ir(
+            [support.make_node("T001")], [], budget_tokens=50
+        )
+        self.seed_over_limit_ledger(
+            flow_ir, hop_dispatches=1, tokens=900, tripped_gates=("budget",), resumed=True
+        )
+
+        final_state = self.run_flow_once(flow_ir)
+
+        self.assertTrue(final_state.is_done())
+        self.assertEqual(final_state.tripped_gates(), ("budget",))
+        self.assertEqual(
+            len(self.gate_events_named("budget")), 1, "已了结的 budget 闸不得重复落账"
+        )
+
     def test_resumed_hop_gate_lets_retry_progress_again(self) -> None:
         """FIX-B2：hop 闸触发 → resume 豁免 → 再 run 继续投递（不再被同一闸拦死），
         直到 retry 闸接棒转人审。"""

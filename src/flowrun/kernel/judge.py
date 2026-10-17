@@ -218,13 +218,29 @@ def extract_last_verdict(stdout_text: str) -> dict | None:
 
 
 def _collect_balanced_json_objects(stdout_text: str) -> list[str]:
-    """收集文本里全部平衡花括号的顶层 {...} 子串（字符串内的花括号可能误配，
-    但误配片段会在 json.loads 处被丢弃，不产生安全问题——只解析不执行）。
+    """收集文本里全部平衡花括号的顶层 {...} 子串（K4：字符串感知）。
+
+    扫描时跟踪"是否在 JSON 字符串内 + 转义状态"，**只在字符串外**计花括号
+    深度——``evidence: ["a } b"]`` 这类字符串内的花括号是合法 JSON，旧实现
+    会误配并丢掉整段判定。只有候选花括号已开始（depth > 0）才进入字符串态，
+    因此 JSON 之前的散文（引号不可信）不会把后续内容整片吞掉。
+
+    误配片段仍会在 json.loads 处被丢弃，不产生安全问题——只解析不执行。
     """
     json_candidates: list[str] = []
     brace_depth = 0
     candidate_start_position: int | None = None
+    inside_string = False
+    escape_pending = False
     for character_position, character in enumerate(stdout_text):
+        if inside_string:
+            if escape_pending:
+                escape_pending = False
+            elif character == "\\":
+                escape_pending = True
+            elif character == '"':
+                inside_string = False
+            continue
         if character == "{":
             if brace_depth == 0:
                 candidate_start_position = character_position
@@ -237,6 +253,8 @@ def _collect_balanced_json_objects(stdout_text: str) -> list[str]:
                         stdout_text[candidate_start_position : character_position + 1]
                     )
                     candidate_start_position = None
+        elif character == '"' and brace_depth > 0:
+            inside_string = True
     return json_candidates
 
 

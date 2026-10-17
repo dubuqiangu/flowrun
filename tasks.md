@@ -51,8 +51,9 @@
 
 ### 投影与冒烟
 
-- [x] **T011 todo 投影**：从 ledger 派生勾选状态；用户三操作（人审行勾选 / `@pause` / `@skip`）落账生效；增删节点行忽略并告警。
-  - 验收：`@pause` 后节点确实停在 ready；`@skip` 记事件不消失。
+- [x] **T011 todo 投影**：从 ledger 派生勾选状态；用户三操作（人审行勾选 / `<!-- @pause -->` / `<!-- @skip -->`）落账生效；增删节点行忽略并告警。
+  - 验收：`<!-- @pause -->` 后节点确实停在 ready；`<!-- @skip -->` 记事件不消失。
+  - 注（2026-10-16 语法 v2）：指令只认**行尾 HTML 注释**形式，节点 label 里的裸 `@pause/@skip/@resume` 已失效。
 
 - [x] **T012 AGENTS.stub.md 生成器**：内核为工作区生成的 agent 引导桩（说明 packet 协议、契约自报格式）。
   - 验收：新会话 agent 只读桩即能正确自报产物。
@@ -101,23 +102,69 @@
 
 ---
 
-### M1 审计修复批次（2026-10-16，三线并行，已完成）
+### M1 审计修复批次（第一轮，2026-10-16，三线并行，已完成）
 
 - [x] **A · 编译器/适配层 13 项**：命令注入 **P0**（Windows `.cmd/.bat` 垫片自动切换 path 注入模式，packet 正文一个字节不进 argv）、超时 kill 不达孙进程（`taskkill /T /F`）、`shlex` 吃 Windows 反斜杠（新增 `split_agent_command`）、`out=` 路径逃逸、frontmatter 引号残余/重复键/行内注释（严格化）、`when` 大小写、适配器匹配大小写、timeout 边组合约束、自环边、未闭合 subgraph、数值下限。结构拆分：新增 `mermaid_edge_label.py` / `mermaid_errors.py`。**新增 46 个测试。**
 - [x] **B · 内核/状态层 5 项**：fan-in 错峰完成引发 done→ready 回退与重复投递（投影"只前进不后退"+ 边激活终态守卫双保险）、闸重复刷账与"等待点优先 + 每闸每 run 至多一次 + `flow_resumed` 永久豁免"、工作区身份校验（`FlowWorkspaceMismatchError`）、判定路径 probe 前置 + judge 异常兜底、judge 证据合并后总量上限。**新增 16 个测试。**
-- [x] **C · CLI/todo 5 项**：`resume` 子命令与 todo `@resume` 通道（`flow_resumed` 生产者）、退出码语义分义（`3` 编译校验 / `4` 工作区不匹配 / `5` 未初始化）、`status/todo` 缺账本退 5、todo 头部 `FLOW PAUSED` 闸详情横幅、派生勾选静默化。**新增 13 个测试。**
+- [x] **C · CLI/todo 5 项**：`resume` 子命令与 todo `<!-- @resume -->` 通道（`flow_resumed` 生产者）、退出码语义分义（`3` 编译校验 / `4` 工作区不匹配 / `5` 未初始化）、`status/todo` 缺账本退 5、todo 头部 `FLOW PAUSED` 闸详情横幅、派生勾选静默化。**新增 13 个测试。**
 - 验收证据：独立跑 `python -m unittest discover -s tests` → **294 tests OK**；每条修复均留"回退该修复即变红"留痕。文档漂移 D1-D13 已同步回写 design.md / interfaces.md。
+
+### M1 审计修复批次（第二轮，2026-10-16，已完成）
+
+- [x] **机器闸独立判定**：`hop` 与 `budget` 各自独立判定，同一轮可同时命中并各自落 `gate_tripped`；"每工作区每闸名至多一次 + 其后有 `flow_resumed` 即永久豁免"按**闸名**分别判定——一个闸被人审豁免不连坐另一个闸；收口前（⑦）复查与轮首（③）同口径。
+- [x] **工作区身份收紧为严格集合相等**：`flow_started.planned_nodes` 与当前图节点集双向一致，多一个或少一个都拒（`kernel/engine.py::verify_workspace_matches_flow`）；`planned_nodes` 缺失/为空降级只校验 run 名，空账本不校验，非空但无 `flow_started` 不拦；校验零写入且在任何写入之前，`run`/`resume` 同一套；不符退 `4`。
+- [x] **边缘激活终态守卫**：`edge_taken` 不改写终态（done/skipped/failed）target，内核 ⑤ 层遇到即跳过该边且不落 `edge_taken`；"整图收口"用 done/skipped，"边缘激活可否改写 target"用 done/skipped/failed；失败节点重投只经失败处置策略显式落的 `node_entered`。
+- [x] **todo 指令标记语法 v2**：只认行尾 HTML 注释形式，裸标记失效并给每轮每文件至多一条升级告警；`@resume` 仍是全局标记（仅暂停态才落 `flow_resumed{by:"todo"}`）；头部/横幅注释不出现嵌套 HTML 注释。
+- [x] **新增退出码 `6`（账本损坏）**：中段不可解析 / 哈希链断裂 / 快照核对失败 / 快照记录形状非法；CLI 入口统一捕获，stderr 给含 `ledger.jsonl` 路径与原因的可读诊断，不打 traceback。退出码表补全为 0=done、1=waiting、2=halted（M1 保留位）、3=编译/校验错、4=工作区身份不符、5=未初始化、6=账本损坏。
+- [x] **`out=` 根相对路径拒绝**：新增拒绝 `\x`、`/x`、`\Windows\win.ini` 这类盘根相对形制，UNC 与盘符/绝对路径、`..` 段仍拒（`compiler/validator.py`）。
+- [x] **`.ps1` 垫片纳入 path 模式**：`.cmd/.bat/.ps1` 一律 path 注入；`.cmd/.bat` 走 `subprocess.list2cmdline` 生成的整条命令行交 `create_subprocess_shell`，`.ps1` 走 `powershell -NoProfile -ExecutionPolicy Bypass -File`；win32 命令头按候选扩展集做有界 PATH 扫描，探测与派发同一入口；不可解析抛 `CommandHeadUnresolvableError`（继承 `FileNotFoundError`）。
+- [x] **`split_agent_command`（win32）**：采用 `CommandLineToArgvW` 语义（优先 ctypes，不可用时等价手写回退）；引号内 `&`/`;`/`|`/`%` 字面量，空词丢弃，未闭合引号仍报错；非 win32 分支不变。
+- [x] **恢复增量化**：链校验只校验新增条目（文件变短回退全量），最新快照记录进程内缓存 + 低成本失效判据；磁盘格式不变、恢复等价性不变。
+- 验收证据：独立跑 `python -m unittest discover -s tests` → **358 tests OK**；本轮语义已回写 README.md / design.md / interfaces.md。
+
+#### 本轮行为变更（面向用户，升级前请读）
+
+- **工作区身份收紧**：由"只拦旧节点消失"改为**严格集合相等**——过去靠同 run 名复用工作区、且节点集不同的用法，升级后启动即拒（退出码 `4`）。
+- **todo 标记语法 v2**：旧的裸 `@pause/@skip/@resume` 失效（给一条升级告警），须改为行尾 `<!-- @pause -->` 形式。
+- **`.ps1` 垫片**：由 content 模式改为 path 模式。
+- **新增退出码 `6`**（账本损坏）。
+
+### M1 审计遗留（第二轮新发现，并入 M2 处理）
+
+| 条目 | 现象 | 位置 |
+|---|---|---|
+| out= 放行 NTFS ADS | `a.txt:stream` 形式未被拦（非路径逃逸，但可指同目录数据流） | `compiler/validator.py` |
+| cmd 垫片参数级注入面 | 模板参数本身含 `&`/`%`/`"` 时仍被 cmd.exe 重分词（暴露面与修复前同级，未新增） | `adapters/base.py` 启动计划 |
+| shell 命令头 content 模式理论绕过 | `cmd`/`powershell` 命令头走 content 模式的理论绕过面（默认多行 packet 不可触发） | `adapters/base.py` 注入模式判定 |
+| path 模式不中和 `%VAR%` | 仅当工作区路径含 `%…%` 时暴露 | `adapters/base.py` |
+| 数值无上界 | `timeout` 可溢出为 `inf`；`budget_tokens`/`retry` 无上限 | `compiler/mermaid_edge_label.py`、`compiler/mermaid_parser.py` |
+| `timeout:` 边可指向 `human` | 现只拒 join/decision | `compiler/validator.py` |
+| 退出码 `2` 无生产者 | M1 无 `flow_halted`/`checkpoint` 写入方，`is_halted()` 恒 False、相关分支为死代码 | `cli.py`、`state/flow_state.py` |
+| CLI 单一 `except OSError` 误报 | 写盘失败被报成"无法读取流程文件" | `cli.py` |
+| 勾选未到达的人审节点即判 done | 勾选尚未到达 `awaiting_human` 的人审节点会被立即判 done | `kernel/todo_projection.py` |
+| judge 异常后判节点进死胡同 | judge 异常兜底后判定节点无再审路径，resume 不可恢复 | `kernel/engine_node_executors.py`、`kernel/engine_gates.py` |
+| usage 重复计数 | usage 同时含数字叶子与 `total_tokens` 时重复计数 | `kernel/engine_evidence.py` |
+| 只读判定代理带写副作用 | 只读判定代理构造 `EventLedger` 会截断账本尾行 | `kernel/hooks_assembly.py`、`state/ledger.py` |
+| 引擎账本句柄泄漏 | `run_flow` 抛异常时内部账本句柄不关闭（测试可见 `ResourceWarning: unclosed file ledger.jsonl`） | `kernel/engine.py` |
+| 异常账本身份校验被跳过 | 账本非空但无 `flow_started` 时身份校验跳过、直接放行 | `kernel/engine.py` |
+| 同源同目标多边被幂等合并 | 多条无条件边被幂等键合并，丢失"哪条 when 边走"的审计事实 | `kernel/engine_gates.py` |
+| 恢复增量盲区 | 同进程内"原地改写已确认前缀"不可被增量路径察觉（跨实例首次仍全量、可检出） | `state/ledger.py` |
+| `split_agent_command` 语义边界 | 空参数丢弃的语义将来若需传空参数会变；手写回退实现对病态引号序列与原生可能不一致 | `compiler/mermaid_parser.py` |
+| 测试文件拆分 | 以下测试文件超 ~400 行组织约定，建议纯搬移拆分 | `tests/test_mermaid_parser.py`、`tests/test_compiler_validator.py`、`tests/test_cli.py`、`tests/test_todo_projection.py` |
+
+> **存量台账复核（T020i–T020p）**：逐条复核后**均未关闭**——`T020i` 部分覆盖（见下）、`j/k/l/m/n` 原因未变维持开放、`o/p` 补注（见下）。
 
 ### M1 审计遗留（新发现，并入 M2 处理）
 
 - [ ] **T020i 内核热路径 O(E²)**：`ledger.entries` 每次全量拷贝，长流程下判定/证据装配呈二次复杂度。
+  - （2026-10-16 复核：本轮的**账本链增量校验 + 快照缓存**已覆盖**快照/恢复路径**的重复全量开销；判定/证据装配等其余热路径是否仍为 O(E²) 未实测，**保持开放**，不因部分覆盖而关闭。）
 - [ ] **T020j 失败归因写进 payload**：`node_failed` 只写通用 reason，真实原因要从邻接事件反推。
 - [ ] **T020k join 前驱不可达需提示**：join 存在永远无法到达的前驱时不报错、不设闸、不提示，流程静默悬挂。
 - [ ] **T020l verdict.edge 口径统一**：判定协议给的是边编号（`D001->H001`），落账写的是目标节点 id——统一为边编号（design.md §5.2 已记）。
 - [ ] **T020m 审计文件名去实例耦合**：审计文件名含进程/实例信息，跨 run 不稳定。
 - [ ] **T020n 内核模块再拆分**：`hooks_assembly.py`（391 行）/ `engine_node_executors.py`（375 行）物理行数偏高，建议把"证据转换"段与 decision 执行器抽为独立模块（均低于 ~400 硬阈值，非阻塞）。
-- [ ] **T020o 测试缺口补齐**：`@pause` 引擎级、闸后停住/恢复的引擎侧直测、`missing_outputs` 分支、T012 桩行为验收、"exit≠0 但产物齐"的语义完成组合，逐条钉桩。
-- [ ] **T020p 测试卫生**：全套偶发 `ResourceWarning: unclosed file … ledger.jsonl`（疑似某测试的只读 ledger 视图未关闭）。
+- [ ] **T020o 测试缺口补齐**：`@pause` 引擎级、闸后停住/恢复的引擎侧直测、`missing_outputs` 分支、T012 桩行为验收、"exit≠0 但产物齐"的语义完成组合，逐条钉桩。（`@pause` 用例按 v2 行尾 HTML 注释形式 `<!-- @pause -->` 钉桩。）
+- [ ] **T020p 测试卫生**：全套偶发 `ResourceWarning: unclosed file … ledger.jsonl`（疑似某测试的只读 ledger 视图未关闭）。（2026-10-16 复核：已定位两条候选根因——`kernel/engine.py` 引擎异常时账本句柄泄漏、`kernel/hooks_assembly.py` 只读判定代理自建 `EventLedger`；两者已登记于本轮台账，待修复后复验。）
 
 ---
 

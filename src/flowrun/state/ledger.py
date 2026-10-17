@@ -5,7 +5,8 @@ append-only JSONL：每行一个事件的 canonical JSON。写路径 flush + fsy
 安全性设计：
 - prev-link 哈希链：条目哈希 = sha256(prev_hash + canonical_json(条目去掉 prev_hash 字段))；
   下一条的 prev_hash 存上一条的哈希；首条 prev_hash = GENESIS_PREV_HASH（64 个 '0'）。
-  verify_chain() 逐行重算比对（含 seq 连续性）。已知性质：链只能发现"其后还有条目"
+  verify_chain() 逐行重算比对（含 seq 连续性），并在实例内**增量**推进：已确认
+  的前缀不重复读盘，只校验新增条目（K5）。已知性质：链只能发现"其后还有条目"
   的篡改——最后一条自身被改要等到下一条落账、或由快照记录的 head_hash 兜底
   （见 state.snapshots.recover_flow_state）。
 - idem 幂等：append() 不去重（崩溃后允许同 idem 重复落账），replay()/FlowState 投影时
@@ -125,6 +126,10 @@ class EventLedger:
         self._write_handle: IO[bytes] | None = None
         self._entries_cache: list[LedgerEntry] = []
         self._head_hash = GENESIS_PREV_HASH
+        # 增量链校验游标（K5）：本实例已确认的账本前缀边界
+        self._confirmed_entry_count = 0
+        self._confirmed_head_hash = GENESIS_PREV_HASH
+        self._confirmed_byte_offset = 0
         self._truncate_incomplete_tail_line()
         self._load_existing_entries()
 
@@ -183,24 +188,68 @@ class EventLedger:
         return list(self._entries_cache)
 
     def verify_chain(self) -> bool:
-        """重读磁盘逐行校验 prev-link 哈希链 + seq 连续性；任何断裂/不可解析 → False。
+        """校验磁盘上 prev-link 哈希链 + seq 连续性；任何断裂/不可解析 → False。
+
+        K5 增量校验：本实例内**已确认的前缀不再重复读盘 / 重算哈希**，只读上次
+        校验点之后的新增字节并续算链——主循环每轮多次调用本方法，全量重读会让
+        恢复退化成 O(N²) I/O。
+
+        安全边界：只要文件比上次校验时更短（被截断 / 重写），就回退到从头全量
+        校验；**新实例的首次调用永远是全量校验**，因此跨进程 / 跨实例的防篡改
+        核对（含快照 head_hash 兜底）语义不变。同一实例内对"已确认前缀"的原地
+        改写在增量路径下不可见——该实例自身只做追加，不覆盖历史。
 
         只读不修复；不完整尾行按恢复规则忽略。
         """
         try:
-            disk_entries = self._read_complete_entries_from_disk()
+            (
+                confirmed_entry_count,
+                confirmed_head_hash,
+                confirmed_byte_offset,
+            ) = self._verify_chain_incrementally()
         except FileNotFoundError:
             return True  # 尚未落盘的空账本：链空即有效
         except (LedgerCorruptionError, OSError):
             return False
-        expected_prev_hash = GENESIS_PREV_HASH
-        expected_seq = 1
-        for entry in disk_entries:
-            if entry.seq != expected_seq or entry.prev_hash != expected_prev_hash:
-                return False
-            expected_prev_hash = compute_entry_hash(entry)
-            expected_seq += 1
+        self._confirmed_entry_count = confirmed_entry_count
+        self._confirmed_head_hash = confirmed_head_hash
+        self._confirmed_byte_offset = confirmed_byte_offset
         return True
+
+    def _verify_chain_incrementally(self) -> tuple[int, str, int]:
+        """从上次校验点续算链，返回 (已确认条目数, 链头哈希, 已确认字节偏移)。
+
+        偏移只落在**完整行**（结尾换行符）之后，不完整的尾行留给下次校验；
+        文件比上次校验时更短（被截断 / 重写）→ 从头全量校验。
+        """
+        if not self.ledger_path.exists():
+            return 0, GENESIS_PREV_HASH, 0
+        file_size = self.ledger_path.stat().st_size
+        resume_offset = self._confirmed_byte_offset
+        confirmed_entry_count = self._confirmed_entry_count
+        expected_prev_hash = self._confirmed_head_hash
+        if resume_offset == 0 or resume_offset > file_size:
+            resume_offset = 0
+            confirmed_entry_count = 0
+            expected_prev_hash = GENESIS_PREV_HASH
+        with open(self.ledger_path, "rb") as ledger_handle:
+            ledger_handle.seek(resume_offset)
+            tail_bytes = ledger_handle.read()
+        line_chunks = tail_bytes.split(b"\n")
+        trailing_chunk = line_chunks.pop()  # 结尾 b"" = 完整；否则是崩溃留下的半行
+        confirmed_byte_offset = resume_offset + len(tail_bytes) - len(trailing_chunk)
+        for line_index, line_bytes in enumerate(line_chunks, start=confirmed_entry_count + 1):
+            if not line_bytes.strip():
+                raise LedgerCorruptionError(f"{self.ledger_path} 第 {line_index} 行是空行")
+            entry = self._parse_line(line_bytes, line_index)
+            if entry.seq != confirmed_entry_count + 1 or entry.prev_hash != expected_prev_hash:
+                raise LedgerCorruptionError(
+                    f"{self.ledger_path} 第 {line_index} 行链断裂："
+                    f"seq={entry.seq} / prev_hash 与既有前缀不接"
+                )
+            expected_prev_hash = compute_entry_hash(entry)
+            confirmed_entry_count += 1
+        return confirmed_entry_count, expected_prev_hash, confirmed_byte_offset
 
     def replay(self) -> FlowState:
         """全量重放：新 FlowState 投影全部条目（idem 幂等去重，只认第一条）。

@@ -104,6 +104,8 @@ class SnapshotStore:
 
 恢复实际契约：`recover_flow_state(ledger, snapshot_store)` = 最新快照投影 + 对快照点之后的条目经 `FlowState.merge_from_events()` 增量合并（`EventLedger.replay()` **无 seq 参数**，是整账重放）。恢复时做防篡改双重核对：快照覆盖点的链校验 + `head_hash` 比对。写入用 temp 文件 + `os.replace` 原子替换。
 
+**增量实现细节（M1 已落地，磁盘格式与恢复等价性不变）**：链校验只校验**新增条目**——实例内已确认的前缀不重复读盘/重算哈希，文件比上次校验点更短时回退全量，新实例首次调用永远全量；最新快照记录做进程内缓存 + 低成本失效判据。已知盲区：同进程内"原地改写已确认前缀"增量路径察觉不到（跨实例首次仍走全量、可检出，见 tasks.md 台账）。
+
 ## 4. 域C · 适配层
 
 ### base.py API（冻结）
@@ -140,7 +142,16 @@ def probe_available(agent_registry: dict[str, AgentCommandSpec]) -> dict[str, bo
 
 占位符机制：命令模板里允许 `__FLOW_PACKET__`（替换为 packet 正文的注入位置）或 `__FLOW_PACKET_PATH__`（替换为 packet 绝对路径）；**模板内出现任一占位符时不再追加末尾参数**。投递方式默认（模板无占位符）：`packet` 作为最后位置参数注入（`claude -p "$(cat packet)"` 语义）。
 
-**注入模式（M1 安全约束，实测取证）**：命令头经 `shutil.which` 解析为 `.cmd/.bat` 时，内核自动改用 **path 模式**——`__FLOW_PACKET__` 与 `__FLOW_PACKET_PATH__` 一律替换为路径，packet **正文一个字节都不进 argv**（`cmd /c shim …` 的命令行会被 cmd.exe 重新分词，正文里的 `"` / `&` / `|` 等于把 packet 内容当命令执行）。因此**垫片型 agent 的模板必须显式消费路径占位符**（见下方 opencode 例），否则末位追加的只是一个路径字符串、agent 拿不到正文。
+**注入模式（M1 安全约束，实测取证）**：命令头经 `shutil.which` 解析为垫片（`.cmd` / `.bat` / `.ps1`；win32 上 `which` 未命中时按候选扩展集 `.exe/.cmd/.bat/.ps1` 做**有界 PATH 扫描**兜底，**探测与派发使用同一入口**）时，内核自动改用 **path 模式**——`__FLOW_PACKET__` 与 `__FLOW_PACKET_PATH__` 一律替换为路径，packet **正文一个字节都不进 argv**（命令行会被解释器重新分词，正文里的 `"` / `&` / `|` 等于把 packet 内容当命令执行）。因此**垫片型 agent 的模板必须显式消费路径占位符**（见下方 opencode 例），否则末位追加的只是一个路径字符串、agent 拿不到正文。
+
+两种垫片的启动方式不同：
+
+- `.cmd` / `.bat`：正文进文件，启动时把**整条命令行**（由 `subprocess.list2cmdline` 生成）交给 `create_subprocess_shell`，以规避"垫片路径与参数都含空格时 cmd 引号剥离导致垫片根本不执行"。
+- `.ps1`：与 `.cmd/.bat` 一样走 path 模式，启动方式为 `powershell -NoProfile -ExecutionPolicy Bypass -File <shim>`。
+
+命令头在 win32 上不可解析时抛 `CommandHeadUnresolvableError`（**继承 `FileNotFoundError`**）并给可读提示，不再让 `WinError 2` 穿透。
+
+**`split_agent_command`（win32 命令分词）**：采用 `CommandLineToArgvW` 语义（优先 ctypes 原生调用，不可用时回退到按 MS 规则的等价手写实现）——引号内的 `&`、`;`、`|`、`%` 是**字面量**，空词丢弃，未闭合引号仍报错；**非 win32 分支行为不变**（仍走 `shlex`）。
 
 claude/opencode 两个适配器 + registry 的声明式注册，具体命令按 design.md §2.2 调研结论（现场已查证）：
 - claude：`claude -p --output-format stream-json`

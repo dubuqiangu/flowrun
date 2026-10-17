@@ -6,6 +6,7 @@ WinError 2），必须在适配层做垫片解析。非 Windows 平台本文件�
 """
 import asyncio
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -21,15 +22,19 @@ if str(_SRC_ROOT) not in sys.path:
 
 from flowrun.adapters.base import (  # noqa: E402
     DispatchResult,
+    CommandHeadUnresolvableError,
     StreamMonitoringAdapter,
-    resolve_windows_command_shim,
+    plan_windows_command_launch,
+    resolve_injection_mode,
 )
+from flowrun.adapters.registry import resolve_command_path  # noqa: E402
 
 IS_WINDOWS = sys.platform == "win32"
+ECHO_ARGUMENTS_SHIM_BODY = "@echo off\r\necho SHIM_ARGS:%*\r\nexit /b 0\r\n"
 
 
-class ResolveWindowsCommandShimTest(unittest.TestCase):
-    """纯函数单测：垫片识别与命令重写规则。"""
+class PlanWindowsCommandLaunchTest(unittest.TestCase):
+    """纯函数单测：垫片识别、启动方式与"不可解析"错误。"""
 
     def setUp(self):
         if not IS_WINDOWS:
@@ -42,44 +47,69 @@ class ResolveWindowsCommandShimTest(unittest.TestCase):
         shim_path.write_text("@echo off\r\n", encoding="ascii")
         return shim_path
 
-    def test_cmd_shim_rewritten_via_cmd_c(self):
-        shim_path = self._write_shim("fake_agent.cmd")
+    def test_cmd_shim_planned_as_cmd_shell_command_line(self):
+        self._write_shim("fake_agent.cmd")
         with mock.patch.dict(os.environ, {"PATH": str(self.tmp_dir)}):
-            rewritten = resolve_windows_command_shim(
+            launch_plan = plan_windows_command_launch(
                 ["fake_agent", "-p", "--packet", "x.md"]
             )
-        self.assertEqual(rewritten[0], "cmd")
-        self.assertEqual(rewritten[1], "/c")
-        # shutil.which 在 Windows 可能返回大写扩展名（fake_agent.CMD），路径比较不区分大小写。
-        self.assertEqual(str(Path(rewritten[2])).casefold(), str(shim_path).casefold())
-        self.assertEqual(rewritten[3:], ["-p", "--packet", "x.md"])
+        # .cmd 垫片只能经 cmd.exe 的整条命令行启动（argv 形态会被 cmd 重新分词）
+        self.assertIsNone(launch_plan.exec_arguments)
+        # 盘上大小写可能不同（which/字面探测保留实际文件名），比较不区分大小写
+        self.assertIn("fake_agent.cmd", launch_plan.shell_command_line.casefold())
+        self.assertTrue(
+            launch_plan.shell_command_line.endswith("-p --packet x.md"),
+            launch_plan.shell_command_line,
+        )
 
-    def test_bat_shim_rewritten_via_cmd_c(self):
+    def test_bat_shim_planned_as_cmd_shell_command_line(self):
         self._write_shim("fake_agent.bat")
         with mock.patch.dict(os.environ, {"PATH": str(self.tmp_dir)}):
-            rewritten = resolve_windows_command_shim(["fake_agent"])
-        self.assertEqual(rewritten[:2], ["cmd", "/c"])
+            launch_plan = plan_windows_command_launch(["fake_agent"])
+        self.assertIsNone(launch_plan.exec_arguments)
+        self.assertIn("fake_agent.bat", launch_plan.shell_command_line.casefold())
 
-    def test_ps1_shim_rewritten_via_powershell(self):
+    def test_ps1_shim_planned_through_powershell(self):
         ps1_path = self.tmp_dir / "fake_agent.ps1"
         ps1_path.write_text("Write-Output ok\n", encoding="ascii")
         # 默认 PATHEXT 不含 .PS1，须显式补上（真机 opencode.ps1 场景：npm 垫片通常同时有 .cmd）。
         with mock.patch.dict(os.environ, {"PATH": str(self.tmp_dir),
                                           "PATHEXT": ".COM;.EXE;.CMD;.PS1"}):
-            rewritten = resolve_windows_command_shim(["fake_agent"])
-        self.assertEqual(rewritten[0], "powershell")
-        self.assertIn("-File", rewritten)
-        self.assertEqual(str(Path(rewritten[-1])).casefold(), str(ps1_path).casefold())
+            launch_plan = plan_windows_command_launch(["fake_agent"])
+        self.assertIsNone(launch_plan.shell_command_line)
+        self.assertEqual(launch_plan.exec_arguments[0], "powershell")
+        self.assertIn("-File", launch_plan.exec_arguments)
+        self.assertEqual(
+            str(Path(launch_plan.exec_arguments[-1])).casefold(), str(ps1_path).casefold()
+        )
 
-    def test_plain_command_untouched_when_not_resolvable(self):
-        with mock.patch.dict(os.environ, {"PATH": str(self.tmp_dir)}):
-            rewritten = resolve_windows_command_shim(
-                ["no_such_cli_anywhere", "run"]
-            )
-        self.assertEqual(rewritten, ["no_such_cli_anywhere", "run"])
+    def test_non_shim_command_head_is_passed_through_unchanged(self):
+        launch_plan = plan_windows_command_launch(
+            [sys.executable, "-m", "flowrun_fake_agent"]
+        )
+        self.assertIsNone(launch_plan.shell_command_line)
+        self.assertEqual(
+            list(launch_plan.exec_arguments),
+            [sys.executable, "-m", "flowrun_fake_agent"],
+        )
 
-    def test_empty_command_untouched(self):
-        self.assertEqual(resolve_windows_command_shim([]), [])
+    def test_empty_command_yields_empty_exec_arguments(self):
+        launch_plan = plan_windows_command_launch([])
+        self.assertEqual(launch_plan.exec_arguments, ())
+        self.assertIsNone(launch_plan.shell_command_line)
+
+
+class WindowsLaunchPlanTest(unittest.TestCase):
+    """启动计划的形状约束：exec argv 与 shell 命令行必须二选一。"""
+
+    def test_plan_rejects_both_forms_and_neither_form(self):
+        from flowrun.adapters.base import WindowsLaunchPlan
+
+        with self.assertRaises(ValueError):
+            WindowsLaunchPlan(exec_arguments=("a",), shell_command_line="a")
+        with self.assertRaises(ValueError):
+            WindowsLaunchPlan()
+        self.assertEqual(WindowsLaunchPlan(exec_arguments=()).exec_arguments, ())
 
 
 class DispatchThroughCmdShimTest(unittest.TestCase):
@@ -114,6 +144,68 @@ class DispatchThroughCmdShimTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertFalse(result.timed_out)
         self.assertTrue(self.packet_path.exists())
+
+
+class DispatchThroughSpacedShimTest(unittest.TestCase):
+    """C2 回归：垫片路径与追加参数**都含空格**时垫片完全不执行。
+
+    旧实现把 ``cmd /c <shim> <args>`` 交给 list2cmdline，得到 4 个引号，
+    触发 cmd.exe 的引号剥离启发式（示例性实测：rc=1、stdout 为空、
+    stderr 是 "'C:\\Users\\...\\flowrun' 不是内部或外部命令"）。
+    这里三条组合都覆盖：两侧含空格 / 仅垫片含空格 / 都不含空格。
+    """
+
+    def setUp(self):
+        if not IS_WINDOWS:
+            self.skipTest("Windows 专属行为")
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="flowrun_shim_spaces_"))
+        self.addCleanup(lambda: _remove_tree_quietly(self.tmp_dir))
+        self.spaced_dir = self.tmp_dir / "dir with space"
+        self.spaced_dir.mkdir()
+        self.plain_dir = self.tmp_dir / "plain"
+        self.plain_dir.mkdir()
+        for shim_directory in (self.spaced_dir, self.plain_dir):
+            (shim_directory / "echo_agent.cmd").write_text(
+                ECHO_ARGUMENTS_SHIM_BODY, encoding="ascii"
+            )
+
+    def _dispatch_through_shim(self, shim_directory: Path,
+                               packet_directory: Path) -> tuple[DispatchResult, Path]:
+        packet_path = packet_directory / "task packet.md"
+        packet_path.write_text("# 任务\n做点事\n", encoding="utf-8")
+
+        async def run_dispatch():
+            adapter = StreamMonitoringAdapter()
+            with mock.patch.dict(os.environ, {"PATH": str(shim_directory)}):
+                return await adapter.dispatch(
+                    packet_path=packet_path,
+                    agent_command=["echo_agent"],
+                    work_dir=self.tmp_dir,
+                    timeout_seconds=10.0,
+                )
+
+        return asyncio.run(run_dispatch()), packet_path.resolve()
+
+    def _assert_placeholder_expanded(self, shim_directory: Path,
+                                     packet_directory: Path) -> None:
+        result, expected_packet_path = self._dispatch_through_shim(
+            shim_directory, packet_directory
+        )
+        stdout_audit = result.stdout_path.read_text(encoding="utf-8", errors="replace")
+        self.assertEqual(result.exit_code, 0, f"stdout={stdout_audit!r}")
+        self.assertFalse(result.timed_out)
+        self.assertIn("SHIM_ARGS:", stdout_audit)
+        # 垫片确实收到并展开出 packet 绝对路径（agent 自己读文件）
+        self.assertIn(str(expected_packet_path), stdout_audit)
+
+    def test_spaced_shim_path_with_spaced_argument_runs(self):
+        self._assert_placeholder_expanded(self.spaced_dir, self.spaced_dir)
+
+    def test_spaced_shim_path_with_plain_argument_runs(self):
+        self._assert_placeholder_expanded(self.spaced_dir, self.plain_dir)
+
+    def test_plain_shim_path_with_plain_argument_runs(self):
+        self._assert_placeholder_expanded(self.plain_dir, self.plain_dir)
 
 
 class BatchShimInjectionSafetyTest(unittest.TestCase):
@@ -157,6 +249,68 @@ class BatchShimInjectionSafetyTest(unittest.TestCase):
         self.assertNotIn(self.DANGEROUS_MARKER, stdout_audit)
         # 垫片拿到的是 packet 文件绝对路径（agent 自己读文件）。
         self.assertIn(str(self.packet_path.resolve()), stdout_audit)
+
+
+class WindowsCommandHeadResolutionTest(unittest.TestCase):
+    """C3：.ps1 也是垫片；PATHEXT 漏掉 .PS1 时有界兜底；解析不到时给可读错误。"""
+
+    def setUp(self):
+        if not IS_WINDOWS:
+            self.skipTest("Windows 专属行为")
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="flowrun_shim_resolve_"))
+        self.addCleanup(lambda: _remove_tree_quietly(self.tmp_dir))
+        (self.tmp_dir / "ps_only_agent.ps1").write_text(
+            "Write-Output ok\n", encoding="ascii"
+        )
+        self.packet_path = self.tmp_dir / "task.packet.md"
+        self.packet_path.write_text("# 任务\n", encoding="utf-8")
+
+    def test_pathext_including_ps1_uses_path_injection_and_powershell(self):
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmp_dir),
+                                          "PATHEXT": ".COM;.EXE;.CMD;.PS1"}):
+            self.assertEqual(resolve_injection_mode(["ps_only_agent"]), "path")
+            launch_plan = plan_windows_command_launch(["ps_only_agent", "-p"])
+        # 不变式：算垫片 ⇒ path 注入 ∧ 经 powershell 启动（两边判定必须一致）
+        self.assertIsNone(launch_plan.shell_command_line)
+        self.assertEqual(launch_plan.exec_arguments[0], "powershell")
+        self.assertIn("-File", launch_plan.exec_arguments)
+
+    def test_pathext_without_ps1_still_resolves_the_ps1_shim(self):
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmp_dir),
+                                          "PATHEXT": ".COM;.EXE;.CMD"}):
+            resolved_path = resolve_command_path("ps_only_agent")
+            self.assertIsNotNone(resolved_path)
+            self.assertEqual(Path(resolved_path).suffix.lower(), ".ps1")
+            self.assertEqual(resolve_injection_mode(["ps_only_agent"]), "path")
+            launch_plan = plan_windows_command_launch(["ps_only_agent"])
+        self.assertEqual(launch_plan.exec_arguments[0], "powershell")
+
+    def test_unresolvable_command_head_raises_readable_error(self):
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmp_dir),
+                                          "PATHEXT": ".COM;.EXE"}):
+            self.assertIsNone(resolve_command_path("ghost_agent"))
+            self.assertEqual(resolve_injection_mode(["ghost_agent"]), "content")
+            with self.assertRaises(CommandHeadUnresolvableError) as raised_context:
+                plan_windows_command_launch(["ghost_agent", "run"])
+        error_message = str(raised_context.exception)
+        self.assertIn("ghost_agent", error_message)
+        self.assertIn("不可解析", error_message)
+
+    def test_dispatch_reports_readable_error_instead_of_winerror2(self):
+        async def run_dispatch():
+            adapter = StreamMonitoringAdapter()
+            with mock.patch.dict(os.environ, {"PATH": str(self.tmp_dir),
+                                              "PATHEXT": ".COM;.EXE"}):
+                return await adapter.dispatch(
+                    packet_path=self.packet_path,
+                    agent_command=["ghost_agent"],
+                    work_dir=self.tmp_dir,
+                    timeout_seconds=10.0,
+                )
+
+        with self.assertRaises(CommandHeadUnresolvableError) as raised_context:
+            asyncio.run(run_dispatch())
+        self.assertIn("ghost_agent", str(raised_context.exception))
 
 
 class ProcessTreeKillTest(unittest.TestCase):
@@ -203,10 +357,7 @@ class ProcessTreeKillTest(unittest.TestCase):
 
 
 def _remove_tree_quietly(directory: Path) -> None:
-    for entry in directory.iterdir():
-        if entry.is_file():
-            entry.unlink()
-    directory.rmdir()
+    shutil.rmtree(directory, ignore_errors=True)
 
 
 if __name__ == "__main__":

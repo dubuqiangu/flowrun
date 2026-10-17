@@ -12,7 +12,7 @@ FlowState 不打开文件、不自己落盘：它由 `EventLedger.replay()` 全�
 | agent_dispatched | 无 | node → running；hop_count +1 |
 | agent_exited | `exit_code`（只审计，不解读） | 无状态影响（等 verdict 事件来转移） |
 | verdict | `edge` / `confidence` / `evidence`（只审计，不解读） | node → judging |
-| edge_taken | `target`: str（目标转移）；`source`: str（event.node 缺席时备用）；`edge`（只审计） | source → done；target → ready（target 已 done/skipped 则**不动**——投影只前进不后退，FIX-B1） |
+| edge_taken | `target`: str（目标转移）；`source`: str（event.node 缺席时备用）；`edge`（只审计） | source → done；target → ready（target 已终态 done/failed/skipped 则**不动**——投影只前进不后退，FIX-B1 + K3） |
 | node_done | `tokens`: 数字（可选，累加） | node → done |
 | node_failed | 无 | node → failed |
 | human_requested | 无 | node → awaiting_human |
@@ -58,20 +58,37 @@ STATUS_UNKNOWN = "unknown"
 
 # user_directive pause 可覆盖的节点状态：非终态、非人审挂起
 _PAUSABLE_STATUSES = frozenset({STATUS_PLANNED, STATUS_READY, STATUS_RUNNING, STATUS_JUDGING})
-# 终态：done / failed / skipped 之后不再被 pause / skip 改写
+# 终态：done / failed / skipped —— 之后不再被 pause / skip / edge_taken 改写
 _TERMINAL_STATUSES = frozenset({STATUS_DONE, STATUS_FAILED, STATUS_SKIPPED})
-# "已走完"的收口终态（FIX-B1）：edge_taken 不得把这类 target 退回 ready
+# "已走完"的收口终态（FIX-B1）：全流完成判定的依据（done / skipped，不含 failed）
 _FINISHED_STATUSES = frozenset({STATUS_DONE, STATUS_SKIPPED})
 
 
 def is_finished_status(status: str) -> bool:
-    """status 是否属于"已走完"的收口终态（done / skipped）。
+    """status 是否属于"已走完"的收口终态（done / skipped）——全流完成判定的依据。
 
-    FIX-B1 的判定依据：fan-in 错峰收尾、barrier 边补激活等**晚到的边**不得
-    让已收口的节点重跑——**投影只前进不后退**。failed 不在其中：失败节点的
-    重投由失败处置策略显式落 ``node_entered`` 承载，不走 edge_taken。
+    与 ``edge_taken_may_activate_target`` 区分：本判定回答"整图是否收口"，
+    因此**不含 failed**（失败节点不构成完成）。
     """
     return status in _FINISHED_STATUSES
+
+
+def edge_taken_may_activate_target(status: str) -> bool:
+    """edge_taken（边缘激活）能否把 target 置为 ready；False = 不得改写。
+
+    单一真相（FIX-B1 + K3）：**终态不可被边缘激活改写**，done / skipped /
+    failed 三者皆然：
+
+    - done / skipped：fan-in 错峰收尾、barrier 补激活等**晚到的边**不得把已收口
+      的节点重新点燃（投影只前进不后退）；
+    - failed：晚到的入边同样不得把已失败节点退回 ready——失败节点的重投只能由
+      失败处置策略显式落的 ``node_entered`` 承载（engine ⑤ 的
+      ``_apply_failure_policy``），否则会绕过重试次数上限与 retry 闸。
+
+    投影层（``FlowState._apply_edge_taken``）与内核 ⑤ 层
+    （``activate_finished_nodes``）共用本判定，保证两处口径一致。
+    """
+    return status not in _TERMINAL_STATUSES
 
 
 
@@ -164,10 +181,12 @@ class FlowState:
         target_node = entry.payload.get("target")
         if source_node is not None:
             self._set_node_status(source_node, STATUS_DONE)
-        if target_node is not None and not is_finished_status(self.node_status(target_node)):
-            # FIX-B1 投影层守卫（投影只前进不后退）：已 done/skipped 的 target
-            # 不得被晚到的边退回 ready——否则下一轮会重复投递（attempt=2、
-            # idem 不同、幂等去重拦不住）。
+        if target_node is not None and edge_taken_may_activate_target(
+            self.node_status(target_node)
+        ):
+            # FIX-B1 + K3 投影层守卫（投影只前进不后退）：已终态（done / skipped /
+            # failed）的 target 不得被晚到的边退回 ready——否则下一轮会重复投递
+            # （attempt=2、idem 不同、幂等去重拦不住），失败节点更会绕过重试闸。
             self._set_node_status(target_node, STATUS_READY)
 
     def _apply_human_resolved(self, entry: LedgerEntry) -> None:

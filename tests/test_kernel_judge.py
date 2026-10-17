@@ -378,6 +378,47 @@ class ExtractLastVerdictTest(unittest.TestCase):
         verdict = extract_last_verdict('{"edge":"D001->H001","confidence":0.7}')
         self.assertEqual(verdict["evidence"], [])
 
+    # ---- K4：字符串上下文内的花括号不得破坏平衡扫描
+
+    def test_closing_brace_inside_string_does_not_break_extraction(self):
+        stdout_text = '{"edge":"D001->H001","confidence":0.9,"evidence":["a } b"]}'
+        verdict = extract_last_verdict(stdout_text)
+        self.assertIsNotNone(verdict, "字符串内的 } 是合法 JSON，必须仍能提取判定")
+        self.assertEqual(verdict["edge"], "D001->H001")
+        self.assertEqual(verdict["evidence"], ["a } b"])
+
+    def test_opening_brace_inside_string_does_not_break_extraction(self):
+        stdout_text = '结论\n{"edge":"D001->H001","confidence":0.9,"evidence":["a { b"]}\n'
+        verdict = extract_last_verdict(stdout_text)
+        self.assertIsNotNone(verdict, "字符串内的 { 是合法 JSON，必须仍能提取判定")
+        self.assertEqual(verdict["edge"], "D001->H001")
+        self.assertEqual(verdict["evidence"], ["a { b"])
+
+    def test_escaped_quote_inside_string_does_not_break_extraction(self):
+        stdout_text = '{"edge":"D001->H001","confidence":0.9,"evidence":["say \\"{\\""]}'
+        verdict = extract_last_verdict(stdout_text)
+        self.assertIsNotNone(verdict, "转义引号后的花括号仍在字符串内，不得被当作结构括号")
+        self.assertEqual(verdict["edge"], "D001->H001")
+        self.assertEqual(verdict["evidence"], ['say "{"'])
+
+    def test_nested_object_is_extracted_as_one_candidate(self):
+        stdout_text = (
+            '{"edge":"D001->H001","confidence":0.9,"evidence":[],'
+            '"extra":{"nested":{"deep":true}}}'
+        )
+        verdict = extract_last_verdict(stdout_text)
+        self.assertIsNotNone(verdict)
+        self.assertEqual(verdict["edge"], "D001->H001")
+
+    def test_last_object_wins_when_earlier_object_has_brace_in_string(self):
+        stdout_text = (
+            '{"edge":"OLD->OLD","confidence":0.9,"evidence":["}"]}\n'
+            '{"edge":"D001->H001","confidence":0.8,"evidence":[]}\n'
+        )
+        verdict = extract_last_verdict(stdout_text)
+        self.assertEqual(verdict["edge"], "D001->H001")
+        self.assertEqual(verdict["confidence"], 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()

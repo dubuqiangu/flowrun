@@ -4,10 +4,16 @@ todo.md 是「ledger 状态的只读投影 + 用户输入信号」二合一文�
 
 - ``write_todo``：从 FlowState 派生各节点的勾选状态，生成/覆盖 todo.md；
   全局暂停时在头部注释区插入 FLOW PAUSED 横幅，让用户一眼看到"卡在哪"；
-- ``apply_user_marks``：解析用户的四类合法操作（人审行勾选 / ``@pause`` /
-  ``@skip`` / ``@resume``），落账为 ``human_resolved`` / ``user_directive`` /
-  ``flow_resumed`` 事件后才生效——**不做双向同步**（design.md §4.2：双向同步是
+- ``apply_user_marks``：解析用户的四类合法操作（人审行勾选 / 暂停 / 跳过 /
+  恢复指令），落账为 ``human_resolved`` / ``user_directive`` / ``flow_resumed``
+  事件后才生效——**不做双向同步**（design.md §4.2：双向同步是
   状态发散的经典死法）。
+
+指令标记语法（v2，**行尾 HTML 注释形式**）：只有 ``<!-- @pause -->`` /
+``<!-- @skip -->`` / ``<!-- @resume -->``（注释内外空白随意）被解析。旧版裸标记
+（节点行里直接写 ``@pause``）**不再生效**——节点 label 是流程作者写的自由文本，
+裸标记会把 label 文本误当用户指令（实测可把已 done 的流重新置为 paused）。
+用户若仍写裸标记，本轮每文件至多给一条可读告警，提示改用注释形式（防静默失效）。
 
 安全性：todo 是用户可自由编辑的不可信输入——只做逐行结构化解析（正则提取
 节点 id / 勾选位 / 行尾标记），绝不 eval/执行；增删节点行一律忽略并向
@@ -56,10 +62,15 @@ __all__ = [
 ]
 
 TODO_HEADER_COMMENT = "<!-- AUTO-GENERATED from flow.mmd · 勿增删节点行 -->"
-TODO_MARKER_COMMENT = "<!-- 用户可用行尾标记：@pause @skip @resume -->"
+# 注意：本行本身是 HTML 注释，其文案**不得再含 "<!--"**，否则会产生嵌套注释
+# （Markdown 会在第一个 "-->" 处提前闭合）。故此处只描述语法，不写示例。
+TODO_MARKER_COMMENT = (
+    "<!-- 用户指令写成节点行行尾的 HTML 注释：@pause（挂起此处）"
+    "@skip（跳过该节点）@resume（恢复整条流） -->"
+)
 HUMAN_HINT = "← 此行可勾选"
 FLOW_PAUSED_BANNER_PREFIX = "FLOW PAUSED"
-RESUME_HINT_TEXT = "运行 flowrun resume 或在该行加 @resume 恢复"
+RESUME_HINT_TEXT = "运行 flowrun resume 恢复，或在节点行行尾用 HTML 注释标记 @resume"
 
 # 生成行尾状态注释的非缺省状态（planned/ready/running 等不加注释，保持文件干净）
 _COMMENTED_STATUSES = frozenset(
@@ -67,9 +78,12 @@ _COMMENTED_STATUSES = frozenset(
 )
 
 _CHECKBOX_LINE_PATTERN = re.compile(r"^\s*-\s*\[([ xX])\]\s+(\S+)(.*)$")
-_PAUSE_MARKER_PATTERN = re.compile(r"@pause\b")
-_SKIP_MARKER_PATTERN = re.compile(r"@skip\b")
-_RESUME_MARKER_PATTERN = re.compile(r"@resume\b")
+# 指令只认行尾 HTML 注释形式；裸 @pause/@skip/@resume 一律不解析（见模块 docstring）
+_PAUSE_MARKER_PATTERN = re.compile(r"<!--\s*@pause\s*-->")
+_SKIP_MARKER_PATTERN = re.compile(r"<!--\s*@skip\s*-->")
+_RESUME_MARKER_PATTERN = re.compile(r"<!--\s*@resume\s*-->")
+_HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->")
+_LEGACY_BARE_MARKER_PATTERN = re.compile(r"@(?:pause|skip|resume)\b")
 # user_directive skip 不再作用于终态节点（与 FlowState 投影规则一致，双保险）
 _NOT_SKIPPABLE_STATUSES = frozenset({STATUS_DONE, STATUS_FAILED, STATUS_SKIPPED})
 
@@ -129,9 +143,11 @@ def apply_user_marks(
 
     四类合法操作（design.md §4.2 + M1 恢复通道）：
     - 人审节点行勾选 ``[x]`` → ``human_resolved{"decision": "approve"}``；
-    - 行尾 ``@pause`` → ``user_directive{"directive": "pause"}``；
-    - 行尾 ``@skip`` → ``user_directive{"directive": "skip"}``；
-    - 行尾 ``@resume``（全流落一次）→ ``flow_resumed{"by": "todo"}``。
+    - 行尾 ``<!-- @pause -->`` → ``user_directive{"directive": "pause"}``；
+    - 行尾 ``<!-- @skip -->`` → ``user_directive{"directive": "skip"}``；
+    - 行尾 ``<!-- @resume -->``（全流落一次）→ ``flow_resumed{"by": "todo"}``。
+
+    节点 label 里的 ``@pause`` 等**裸文本永不触发**任何落账（v2 起只认注释形式）。
 
     幂等：FlowState 已生效（节点已 done / paused / skipped、流已非暂停）的操作不落账，
     也不重复告警——派生勾选行（``[x]`` + ``<!-- done -->``）重跑时静默跳过。每落一条
@@ -239,6 +255,7 @@ def _parse_marked_nodes(todo_text: str) -> tuple[list[TodoNodeMark], set[str]]:
     """逐行解析勾选框行 → (标记列表, 出现过的节点 id 集合)。
 
     非勾选框行（头尾注释等）跳过不告警——用户被允许在节点行之外写自由文本。
+    解析完再对整份文本做一次旧式裸标记体检（告警与落账互不干扰）。
     """
     marks: list[TodoNodeMark] = []
     marked_node_ids: set[str] = set()
@@ -257,7 +274,26 @@ def _parse_marked_nodes(todo_text: str) -> tuple[list[TodoNodeMark], set[str]]:
             )
         )
         marked_node_ids.add(node_id)
+    _warn_on_legacy_bare_markers(todo_text)
     return marks, marked_node_ids
+
+
+def _warn_on_legacy_bare_markers(todo_text: str) -> None:
+    """旧式裸标记（未包进 HTML 注释）在 v2 起失效——每轮每文件至多提醒一次。
+
+    只看节点行（非节点行是用户自由文本，且头部说明本身含裸词）；把行内的 HTML
+    注释整段剔除后再找裸标记，故注释形式的合法指令不会误报。
+    """
+    for raw_line in todo_text.splitlines():
+        if _CHECKBOX_LINE_PATTERN.match(raw_line) is None:
+            continue
+        line_without_comments = _HTML_COMMENT_PATTERN.sub("", raw_line)
+        if _LEGACY_BARE_MARKER_PATTERN.search(line_without_comments) is not None:
+            _warn(
+                "节点行出现旧式裸标记（@pause/@skip/@resume 未包进 HTML 注释），"
+                "v2 起已不再生效——请改写为行尾注释形式（见文件头部说明）"
+            )
+            return
 
 
 def _apply_single_mark(

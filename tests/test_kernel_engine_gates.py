@@ -237,7 +237,7 @@ class KernelEngineGatesTestCase(unittest.TestCase):
         crashed_ledger = EventLedger(self.workspace / "ledger.jsonl")
         crashed_ledger.append(
             "flow_started",
-            {"entry_nodes": ["T001"], "planned_nodes": ["T002"]},
+            {"entry_nodes": ["T001"], "planned_nodes": ["T001", "T002"]},
             "release-login-flow-started",
             flow_ir.run_name,
         )
@@ -299,6 +299,126 @@ class KernelEngineGatesTestCase(unittest.TestCase):
         self.assertIn("retry", final_state.tripped_gates())
         self.assertTrue(final_state.is_paused())
         self.assertEqual(final_state.node_status("T002"), "planned")
+
+
+    # ---------------------------------------------------------------- 失败节点终态守卫（K3）
+
+    def test_failed_node_is_not_revived_by_late_incoming_edge(self) -> None:
+        """K3 复现：X001 重试耗尽失败后，另一分支 M001 的晚到入边不得把它退回 ready。
+
+        修复前 _apply_edge_taken / ⑤ 层只守 done/skipped，failed 被晚到边复活；
+        resume 后它以 attempt=2 重跑，绕过重试策略与 retry 闸。"""
+        entry_task = support.make_node("A001")
+        late_branch_task = support.make_node("M001", label="晚到分支")
+        failing_task = support.make_node("X001", label="重试耗尽")
+        flow_ir = support.make_flow_ir(
+            [entry_task, late_branch_task, failing_task],
+            [
+                support.make_edge("A001", "X001"),
+                support.make_edge("A001", "M001"),
+                support.make_edge("M001", "X001"),
+            ],
+        )
+        self.stubs.script_dispatch_result(
+            "X001", *(support.make_dispatch_result(exit_code=3) for _ in range(5))
+        )
+
+        first_state = self.run_flow_once(flow_ir)
+
+        self.assertEqual(first_state.node_status("X001"), "failed")
+        self.assertIn("retry", first_state.tripped_gates())
+        first_ledger = self.reopened_ledger()
+        late_edges = [
+            edge_entry
+            for edge_entry in support.events_of_type(first_ledger, "edge_taken")
+            if edge_entry.payload.get("source") == "M001"
+            and edge_entry.payload.get("target") == "X001"
+        ]
+        self.assertEqual(
+            late_edges, [], "failed 的 target 不得被晚到入边激活（账本不留假事实）"
+        )
+
+        resume_ledger = self.reopened_ledger()
+        resume_ledger.append(
+            "flow_resumed", {}, f"{flow_ir.run_name}-flow-resumed-1", flow_ir.run_name
+        )
+        resume_ledger.close()
+
+        final_state = self.run_flow_once(flow_ir)
+
+        self.assertEqual(final_state.node_status("X001"), "failed")
+        self.assertEqual(
+            len(support.events_of_type(self.reopened_ledger(), "agent_dispatched", "X001")),
+            1,
+            "失败节点不得被晚到边复活后以 attempt=2 重投",
+        )
+
+    def test_ledger_seeded_failed_node_with_retry_edge_is_still_requeued(self) -> None:
+        """K3 边界：失败节点的**合法**重投路径不受影响——重试边的 node_entered 仍生效。"""
+        flaky_task = support.make_node("T001", label="闪失败")
+        downstream_task = support.make_node("T002")
+        flow_ir = support.make_flow_ir(
+            [flaky_task, downstream_task],
+            [support.make_edge("T001", "T002", retry=2)],
+        )
+        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger.append(
+            "flow_started",
+            {"entry_nodes": ["T001"], "planned_nodes": ["T001", "T002"]},
+            f"{flow_ir.run_name}-flow-started",
+            flow_ir.run_name,
+        )
+        seeded_ledger.append(
+            "node_failed", {"exit_code": 3},
+            f"{flow_ir.run_name}-T001-node-failed-1", flow_ir.run_name, "T001",
+        )
+        seeded_ledger.close()
+        self.stubs.script_dispatch_result("T001", support.make_dispatch_result(exit_code=0))
+
+        final_state = self.run_flow_once(flow_ir)
+
+        self.assertTrue(final_state.is_done())
+        self.assertEqual(final_state.node_status("T001"), "done")
+        requeue_events = support.events_of_type(self.reopened_ledger(), "node_entered", "T001")
+        self.assertEqual(
+            requeue_events[0].payload["reason"], "retry",
+            "failed → ready 必须仍能由失败处置策略的 node_entered 承载",
+        )
+
+    def test_ledger_seeded_timed_out_node_still_walks_timeout_branch(self) -> None:
+        """K3 边界：超时分支仍是失败节点的合法激活路径（failed 源 → 分支 target ready）。"""
+        slow_task = support.make_node("T001", label="会超时")
+        fallback_task = support.make_node("T002", label="超时诊断")
+        flow_ir = support.make_flow_ir(
+            [slow_task, fallback_task],
+            [support.make_edge("T001", "T002", timeout_seconds=60.0)],
+        )
+        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger.append(
+            "flow_started",
+            {"entry_nodes": ["T001"], "planned_nodes": ["T001", "T002"]},
+            f"{flow_ir.run_name}-flow-started",
+            flow_ir.run_name,
+        )
+        seeded_ledger.append(
+            "agent_exited", {"exit_code": None, "timed_out": True},
+            f"{flow_ir.run_name}-T001-agent-exited-1", flow_ir.run_name, "T001",
+        )
+        seeded_ledger.append(
+            "node_failed", {"exit_code": None, "timed_out": True},
+            f"{flow_ir.run_name}-T001-node-failed-1", flow_ir.run_name, "T001",
+        )
+        seeded_ledger.close()
+
+        final_state = self.run_flow_once(flow_ir)
+
+        self.assertTrue(final_state.is_done())
+        self.assertEqual(final_state.node_status("T002"), "done")
+        taken_targets = [
+            edge_entry.payload["target"]
+            for edge_entry in support.events_of_type(self.reopened_ledger(), "edge_taken")
+        ]
+        self.assertEqual(taken_targets, ["T002"])
 
 
 if __name__ == "__main__":
