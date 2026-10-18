@@ -82,6 +82,8 @@ class EventLedger:
     def verify_chain(self) -> bool            # prev-link 哈希链校验
     def replay(self) -> FlowState             # 幂等去重后重放 → 领域状态投影
     def entries(self) -> list[LedgerEntry]    # 只读
+    @classmethod
+    def open_readonly(cls, ledger_path: Path) -> EventLedger   # 只读视图：不截断尾行、不持写句柄、append() 抛 RuntimeError
 
 @dataclass
 class LedgerEntry:
@@ -124,7 +126,7 @@ class AgentAdapter(Protocol):
                        timeout_seconds: float | None) -> DispatchResult: ...
 ```
 
-> **实现超出本冻结面（M1 事实，待并入正式契约）**：`DispatchResult` 另含 `structured_result`（适配器从输出提取的结构化结果）与 `stderr_path`（stderr 审计落盘路径）；`EventLedger` 另含只读 API `last_seq` / `head_hash` / `close()` 与 `with` 上下文管理器支持。
+> **实现超出本冻结面（M1 事实，待并入正式契约）**：`DispatchResult` 另含 `structured_result`（适配器从输出提取的结构化结果）与 `stderr_path`（stderr 审计落盘路径）；`EventLedger` 另含只读 API `last_seq` / `head_hash` / `close()` 与 `with` 上下文管理器支持。**M2 追加**：`EventLedger.open_readonly()` 为面向旁路读取的只读视图（写者构造时截断崩溃尾行，只读视图一律不截断、不持写句柄），判定等只读路径一律走该视图。
 
 - **双信号退出监视器**在此实现：asyncio task `select` 语义——进程退出 vs 语义完成信号 vs 超时，三者竞速；语义完成先到则优雅等待进程退出（宽限期 30s），超期 kill 并记 `timed_out=False, semantic_done=True`。
 - 判定"语义完成"是**适配器私有**逻辑：claude_code 监听 stream-json 的 `result` 消息；opencode 监听事件流到 session idle。

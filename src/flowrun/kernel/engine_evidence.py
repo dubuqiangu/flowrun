@@ -132,12 +132,31 @@ def normalize_verdict(verdict: object) -> VerdictView:
     )
 
 
+TOTAL_SEMANTIC_USAGE_KEYS = frozenset({"total_tokens", "total"})
+"""usage dict 中表示"已含分量"的总数键：优先取用，求和时排除，避免重复计数。"""
+
+
+def _as_token_count(value: object) -> int | None:
+    """把外部数值归一成 int token 数；bool / 非数值 / NaN 一律视为不可用（None）。"""
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and value != value:  # NaN：无法作为 token 数
+        return None
+    return int(value)
+
+
 def extract_usage_tokens(structured_result: dict) -> int:
     """从 DispatchResult.structured_result 提取本次投递消耗的 token 数。
 
-    约定（任务书）：structured_result["usage"] 里的数字进 payload.tokens——
-    usage 为 dict 时对全部数字叶子求和，为单个数字时直接取值；兼容顶层
-    total_tokens。提取不到返回 0（不落 tokens 字段，FlowState 不累加）。
+    约定（任务书）：structured_result["usage"] 里的数字进 payload.tokens。
+    usage 为 dict 时**含 total 时优先取 total，不重复累加分量**：
+    先看 ``total_tokens``，再退到 ``total``；两者都不是数字时才把其余顶层
+    数字叶子求和（求和时排除 ``total_tokens`` / ``total`` 键，嵌套 dict 不递归）。
+    这样 ``{"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}`` 得 30
+    而不是 60。usage 为单个数字时直接取值；兼容 usage 缺失时的顶层
+    ``total_tokens``。提取不到返回 0（不落 tokens 字段，FlowState 不累加）。
     所有外部输入只做结构化读取，绝不 eval。
     """
     if not isinstance(structured_result, dict):
@@ -148,10 +167,16 @@ def extract_usage_tokens(structured_result: dict) -> int:
     if isinstance(usage_value, (int, float)):
         return int(usage_value)
     if isinstance(usage_value, dict):
+        for total_key in ("total_tokens", "total"):
+            total_tokens_value = _as_token_count(usage_value.get(total_key))
+            if total_tokens_value is not None:
+                return total_tokens_value
         return sum(
             int(leaf_value)
-            for leaf_value in usage_value.values()
-            if isinstance(leaf_value, (int, float)) and not isinstance(leaf_value, bool)
+            for leaf_key, leaf_value in usage_value.items()
+            if leaf_key not in TOTAL_SEMANTIC_USAGE_KEYS
+            and isinstance(leaf_value, (int, float))
+            and not isinstance(leaf_value, bool)
         )
     total_tokens_value = structured_result.get("total_tokens")
     if isinstance(total_tokens_value, (int, float)) and not isinstance(total_tokens_value, bool):

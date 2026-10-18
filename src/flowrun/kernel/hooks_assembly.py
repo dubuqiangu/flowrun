@@ -86,9 +86,9 @@ class _JudgeLedgerRecorder:
         self._read_view: EventLedger | None = None
 
     def entries(self) -> list:
-        """透传当前磁盘账本条目（本代理生命周期内只开一次只读视图）。"""
+        """透传当前磁盘账本条目（本代理生命周期内只开一次只读视图，不产生写副作用）。"""
         if self._read_view is None:
-            self._read_view = EventLedger(self.ledger_path)
+            self._read_view = EventLedger.open_readonly(self.ledger_path)
         return self._read_view.entries()
 
     def append(

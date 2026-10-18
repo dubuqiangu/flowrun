@@ -23,17 +23,20 @@ from flowrun.state.ledger import EventLedger  # noqa: E402
 class GateExemptionTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._temp_dir = tempfile.TemporaryDirectory(prefix="flowrun_gate_exempt_test_")
+        # 注册为 cleanup（LIFO）：测试期间注册的账本 close 先执行，之后才删临时目录；
+        # 若在 tearDown 里删目录，Windows 上仍打开的 ledger.jsonl 会让 rmtree 失败。
+        self.addCleanup(self._temp_dir.cleanup)
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = support.KernelHookStubs()
-
-    def tearDown(self) -> None:
-        self._temp_dir.cleanup()
 
     def run_flow_once(self, flow_ir) -> object:
         return asyncio.run(run_flow(flow_ir, self.workspace, self.stubs.build_hooks()))
 
     def reopened_ledger(self) -> EventLedger:
-        return EventLedger(self.workspace / "ledger.jsonl")
+        """重开账本读取落账结果；注册清理，避免测试结束后遗留写句柄（ResourceWarning）。"""
+        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        self.addCleanup(ledger.close)
+        return ledger
 
     def make_budget_overflow_flow(self):
         """两次投递各 10 万 token、预算 15 万：收口前最后一跳烧穿预算 → budget 闸。"""

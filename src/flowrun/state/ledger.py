@@ -11,8 +11,10 @@ append-only JSONL：每行一个事件的 canonical JSON。写路径 flush + fsy
   （见 state.snapshots.recover_flow_state）。
 - idem 幂等：append() 不去重（崩溃后允许同 idem 重复落账），replay()/FlowState 投影时
   相同 idem 只认第一条。
-- 崩溃容错：打开账本时若文件末尾有未写完的行（无结尾换行符），直接截断丢弃——
-  单写者假设下安全，避免后续追加把半行变成"中段垃圾"。
+- 崩溃容错：以写者身份打开账本时，若文件末尾有未写完的行（无结尾换行符），直接
+  截断丢弃——单写者假设下安全，避免后续追加把半行变成"中段垃圾"。只读视图
+  （``EventLedger.open_readonly``）不做任何截断：半行仅在读取时按恢复规则忽略，
+  磁盘字节原样保留，因此判定等旁路读取不会对账本产生写副作用。
 
 磁盘行格式（键与 LedgerEntry 字段一致；值即 canonical_json 的输出）：
 {"idem":"...","node":"T001"|null,"payload":{...},"prev_hash":"<64hex>","run":"...","seq":1,"ts":1697...,"type":"..."}
@@ -118,11 +120,24 @@ class EventLedger:
     """事件账本：JSONL 追加写 + 哈希链 + 幂等重放（冻结 API 见 interfaces.md §3）。
 
     追加语义：seq 全局递增；prev_hash 链到上一条；不查询去重（去重发生在投影层）。
-    崩溃语义：构造时截断不完整尾行；追加后 flush + fsync 立即落盘。
+    崩溃语义：写者构造时截断不完整尾行；追加后 flush + fsync 立即落盘。
+    只读视图：``open_readonly`` 构造，不截断、不持有写句柄、禁止追加。
     """
 
     def __init__(self, ledger_path: Path) -> None:
-        self.ledger_path = Path(ledger_path)
+        self._initialize(Path(ledger_path), is_readonly=False)
+
+    @classmethod
+    def open_readonly(cls, ledger_path: Path) -> EventLedger:
+        """以只读视图打开账本：不截断尾行、不惰性开写句柄、append() 会抛 RuntimeError。"""
+        ledger_view = cls.__new__(cls)
+        ledger_view._initialize(Path(ledger_path), is_readonly=True)
+        return ledger_view
+
+    def _initialize(self, ledger_path: Path, is_readonly: bool) -> None:
+        """两种打开模式的共同初始化（写者模式才截断崩溃半行）。"""
+        self.ledger_path = ledger_path
+        self._is_readonly = is_readonly
         self._write_handle: IO[bytes] | None = None
         self._entries_cache: list[LedgerEntry] = []
         self._head_hash = GENESIS_PREV_HASH
@@ -130,7 +145,8 @@ class EventLedger:
         self._confirmed_entry_count = 0
         self._confirmed_head_hash = GENESIS_PREV_HASH
         self._confirmed_byte_offset = 0
-        self._truncate_incomplete_tail_line()
+        if not is_readonly:
+            self._truncate_incomplete_tail_line()
         self._load_existing_entries()
 
     # ---------------------------------------------------------------- 写路径
@@ -148,7 +164,10 @@ class EventLedger:
         idem_key 必须非空（幂等去重依赖它）；payload 必须可 JSON 序列化，且在落账前
         被深拷贝规范化——调用方之后修改原 dict 不影响已落账内容。
         本方法不做 idem 去重——重复投递允许落账，由 replay()/FlowState 只认第一条。
+        只读视图禁止追加（抛 RuntimeError），保证旁路读取不产生写副作用。
         """
+        if self._is_readonly:
+            raise RuntimeError("只读账本视图不支持追加（append）")
         if not isinstance(idem_key, str) or not idem_key:
             raise ValueError("idem_key 必须是非空字符串（幂等去重依赖它）")
         if not isinstance(event_type, str) or not event_type:
@@ -271,7 +290,10 @@ class EventLedger:
         return self._head_hash
 
     def close(self) -> None:
-        """关闭追加用的文件句柄（幂等；只影响追加，读路径不依赖句柄）。"""
+        """关闭追加用的文件句柄（幂等；只影响追加，读路径不依赖句柄）。
+
+        只读视图从不持有写句柄，因此在本模式下调是空操作。
+        """
         if self._write_handle is not None:
             self._write_handle.close()
             self._write_handle = None
@@ -285,6 +307,9 @@ class EventLedger:
     # ---------------------------------------------------------------- 内部实现
 
     def _open_write_handle(self) -> IO[bytes]:
+        # 只读视图绝不应走到这里；防御性断言防止未来新增写路径绕过 append() 的校验
+        if self._is_readonly:
+            raise RuntimeError("只读账本视图不支持写入（_open_write_handle）")
         if self._write_handle is None:
             self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
             self._write_handle = open(self.ledger_path, "ab")

@@ -34,17 +34,20 @@ class _RaisingJudgeStubs(support.KernelHookStubs):
 class JudgeFallbackTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._temp_dir = tempfile.TemporaryDirectory(prefix="flowrun_judge_fallback_test_")
+        # 注册为 cleanup（LIFO）：测试期间注册的账本 close 先执行，之后才删临时目录；
+        # 若在 tearDown 里删目录，Windows 上仍打开的 ledger.jsonl 会让 rmtree 失败。
+        self.addCleanup(self._temp_dir.cleanup)
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = support.KernelHookStubs()
-
-    def tearDown(self) -> None:
-        self._temp_dir.cleanup()
 
     def run_flow_once(self, flow_ir) -> object:
         return asyncio.run(run_flow(flow_ir, self.workspace, self.stubs.build_hooks()))
 
     def reopened_ledger(self) -> EventLedger:
-        return EventLedger(self.workspace / "ledger.jsonl")
+        """重开账本读取落账结果；注册清理，避免测试结束后遗留写句柄（ResourceWarning）。"""
+        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        self.addCleanup(ledger.close)
+        return ledger
 
     def make_decision_flow(self):
         """上游任务（可用 agent）→ 判定节点 → 收尾，判定 agent 缺省（fake-agent）。"""

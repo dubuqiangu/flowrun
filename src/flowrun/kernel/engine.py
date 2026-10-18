@@ -127,107 +127,116 @@ async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> 
     for required_dir in (packet_dir, audit_dir, snapshots_dir):
         required_dir.mkdir(parents=True, exist_ok=True)
     ledger = EventLedger(workspace / "ledger.jsonl")
-    snapshot_store = SnapshotStore(snapshots_dir)
-    snapshot_action = run_hooks.snapshot or snapshot_store.maybe_snapshot
-    todo_path = workspace / "todo.md"
-    run_name = flow_ir.run_name
-    dispatch_results: dict[str, object] = {}  # 本进程内各节点最近一次 DispatchResult
+    try:
+        snapshot_store = SnapshotStore(snapshots_dir)
+        snapshot_action = run_hooks.snapshot or snapshot_store.maybe_snapshot
+        todo_path = workspace / "todo.md"
+        run_name = flow_ir.run_name
+        dispatch_results: dict[str, object] = {}  # 本进程内各节点最近一次 DispatchResult
 
-    def finish() -> FlowState:
-        final_state = recover_flow_state(ledger, snapshot_store)
-        write_todo(flow_ir, final_state, todo_path)
-        ledger.close()  # 关闭追加句柄（幂等）；读路径不受影响，Windows 下防文件锁
-        return final_state
+        def finish() -> FlowState:
+            final_state = recover_flow_state(ledger, snapshot_store)
+            write_todo(flow_ir, final_state, todo_path)
+            ledger.close()  # 关闭追加句柄（幂等）；读路径不受影响，Windows 下防文件锁
+            return final_state
 
-    verify_workspace_matches_flow(flow_ir, ledger)
+        verify_workspace_matches_flow(flow_ir, ledger)
 
-    if ledger.last_seq == 0:
-        ledger.append(
-            "flow_started",
-            {
-                "entry_nodes": list(flow_ir.entry_node_ids),
-                "planned_nodes": list(flow_ir.nodes),
-            },
-            f"{run_name}-flow-started",
-            run_name,
-        )
-
-    while True:
-        events_before_turn = ledger.last_seq
-        flow_state = recover_flow_state(ledger, snapshot_store)
-
-        # ① 崩溃恢复：running = 上次进程中断（落 node_failed 后 continue，
-        #    让下轮以 failed 身份走 ⑤ 的后继处置）
-        interrupted_node_ids = [
-            node_id
-            for node_id in flow_ir.nodes
-            if flow_state.node_status(node_id) == STATUS_RUNNING
-        ]
-        for node_id in interrupted_node_ids:
-            failure_occurrence = count_node_events(ledger, "node_failed", node_id) + 1
+        if ledger.last_seq == 0:
             ledger.append(
-                "node_failed",
-                {"exit_code": None, "reason": "interrupted_by_restart"},
-                f"{run_name}-{node_id}-node-failed-{failure_occurrence}",
+                "flow_started",
+                {
+                    "entry_nodes": list(flow_ir.entry_node_ids),
+                    "planned_nodes": list(flow_ir.nodes),
+                },
+                f"{run_name}-flow-started",
                 run_name,
-                node_id,
             )
-        if interrupted_node_ids:
-            continue
 
-        # ② 等待点（FIX-B2：先于机器闸）：暂停 / 终止 / 完成 / 人审挂起。
-        #    已暂停的流再 run 不产生任何新事件——闸不会因此重复刷账。
-        if (
-            flow_state.is_paused()
-            or flow_state.is_halted()
-            or flow_state.is_done()
-            or flow_state.pending_human_nodes()
-        ):
-            return finish()
+        while True:
+            events_before_turn = ledger.last_seq
+            flow_state = recover_flow_state(ledger, snapshot_store)
 
-        # ③ 机器闸（hop / budget）：每工作区每闸名至多触发一次（FIX-B2）。
-        #    K1：两个闸各自独立判定，未了结的命中**逐条**落账（trip_gate 自身按闸名幂等，
-        #    一个闸的豁免不会连坐另一个闸）。
-        machine_gate_findings = find_untripped_machine_gates(flow_ir, flow_state, ledger)
-        if machine_gate_findings:
-            for gate_finding in machine_gate_findings:
-                trip_gate(ledger, run_name, gate_finding)
-            return finish()
+            # ① 崩溃恢复：running = 上次进程中断（落 node_failed 后 continue，
+            #    让下轮以 failed 身份走 ⑤ 的后继处置）
+            interrupted_node_ids = [
+                node_id
+                for node_id in flow_ir.nodes
+                if flow_state.node_status(node_id) == STATUS_RUNNING
+            ]
+            for node_id in interrupted_node_ids:
+                failure_occurrence = count_node_events(ledger, "node_failed", node_id) + 1
+                ledger.append(
+                    "node_failed",
+                    {"exit_code": None, "reason": "interrupted_by_restart"},
+                    f"{run_name}-{node_id}-node-failed-{failure_occurrence}",
+                    run_name,
+                    node_id,
+                )
+            if interrupted_node_ids:
+                continue
 
-        # ④ 推进 ready 节点（human_requested → 本轮挂起返回）
-        if await advance_ready_nodes(
-            flow_ir, flow_state, ledger, run_hooks, workspace, dispatch_results
-        ):
-            return finish()
+            # ② 等待点（FIX-B2：先于机器闸）：暂停 / 终止 / 完成 / 人审挂起。
+            #    已暂停的流再 run 不产生任何新事件——闸不会因此重复刷账。
+            if (
+                flow_state.is_paused()
+                or flow_state.is_halted()
+                or flow_state.is_done()
+                or flow_state.pending_human_nodes()
+            ):
+                return finish()
 
-        # ⑤ finished 节点出边激活 + failed 节点处置
-        activate_finished_nodes(flow_ir, recover_flow_state(ledger, snapshot_store), ledger)
-
-        # ⑥ 快照（状态必须已投影到账本 head，故先恢复再快照）
-        flow_state = recover_flow_state(ledger, snapshot_store)
-        snapshot_action(ledger, flow_state)
-
-        # ⑦ 收口：全部 resolved → flow_done；闸复查防"最后一跳烧穿预算"。
-        #    K1：与 ③ 同口径——未了结的机器闸逐条落账（hop / budget 互不遮蔽）。
-        all_nodes_resolved = all(
-            is_finished_status(flow_state.node_status(node_id))
-            for node_id in flow_ir.nodes
-        )
-        if all_nodes_resolved:
-            final_gate_findings = find_untripped_machine_gates(flow_ir, flow_state, ledger)
-            if final_gate_findings:
-                for gate_finding in final_gate_findings:
+            # ③ 机器闸（hop / budget）：每工作区每闸名至多触发一次（FIX-B2）。
+            #    K1：两个闸各自独立判定，未了结的命中**逐条**落账（trip_gate 自身按闸名幂等，
+            #    一个闸的豁免不会连坐另一个闸）。
+            machine_gate_findings = find_untripped_machine_gates(flow_ir, flow_state, ledger)
+            if machine_gate_findings:
+                for gate_finding in machine_gate_findings:
                     trip_gate(ledger, run_name, gate_finding)
-            else:
-                ledger.append("flow_done", {}, f"{run_name}-flow-done", run_name)
-            return finish()
-        if ledger.last_seq == events_before_turn:
-            # 零进展轮：无 ready/running/judging/awaiting/paused/failed 节点，
-            # 则剩余 planned 节点已不可达（判定未选中的分支等）→ 判 flow_done；
-            # 否则（如 join 等未齐的前驱）挂起返回，不空转。
-            if not _has_pending_work(flow_ir, flow_state):
-                ledger.append("flow_done", {}, f"{run_name}-flow-done", run_name)
-            return finish()
+                return finish()
+
+            # ④ 推进 ready 节点（human_requested → 本轮挂起返回）
+            if await advance_ready_nodes(
+                flow_ir, flow_state, ledger, run_hooks, workspace, dispatch_results
+            ):
+                return finish()
+
+            # ⑤ finished 节点出边激活 + failed 节点处置
+            activate_finished_nodes(flow_ir, recover_flow_state(ledger, snapshot_store), ledger)
+
+            # ⑥ 快照（状态必须已投影到账本 head，故先恢复再快照）
+            flow_state = recover_flow_state(ledger, snapshot_store)
+            snapshot_action(ledger, flow_state)
+
+            # ⑦ 收口：全部 resolved → flow_done；闸复查防"最后一跳烧穿预算"。
+            #    K1：与 ③ 同口径——未了结的机器闸逐条落账（hop / budget 互不遮蔽）。
+            all_nodes_resolved = all(
+                is_finished_status(flow_state.node_status(node_id))
+                for node_id in flow_ir.nodes
+            )
+            if all_nodes_resolved:
+                final_gate_findings = find_untripped_machine_gates(flow_ir, flow_state, ledger)
+                if final_gate_findings:
+                    for gate_finding in final_gate_findings:
+                        trip_gate(ledger, run_name, gate_finding)
+                else:
+                    ledger.append("flow_done", {}, f"{run_name}-flow-done", run_name)
+                return finish()
+            if ledger.last_seq == events_before_turn:
+                # 零进展轮：无 ready/running/judging/awaiting/paused/failed 节点，
+                # 则剩余 planned 节点已不可达（判定未选中的分支等）→ 判 flow_done；
+                # 否则（如 join 等未齐的前驱）挂起返回，不空转。
+                if not _has_pending_work(flow_ir, flow_state):
+                    ledger.append("flow_done", {}, f"{run_name}-flow-done", run_name)
+                return finish()
+    finally:
+        # 任何路径（正常 finish / 身份校验失败 / 主循环异常）都释放追加句柄，
+        # 否则 Windows 下账本文件被占用，os.replace / 删除都会失败。
+        # close() 幂等（finish 已关过则无操作），失败也不掩盖原始异常。
+        try:
+            ledger.close()
+        except OSError:
+            pass
 
 
 def verify_workspace_matches_flow(flow_ir: FlowIR, ledger: EventLedger) -> None:

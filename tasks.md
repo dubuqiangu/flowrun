@@ -122,6 +122,15 @@
 - [x] **恢复增量化**：链校验只校验新增条目（文件变短回退全量），最新快照记录进程内缓存 + 低成本失效判据；磁盘格式不变、恢复等价性不变。
 - 验收证据：独立跑 `python -m unittest discover -s tests` → **358 tests OK**；本轮语义已回写 README.md / design.md / interfaces.md。
 
+### M1 审计修复批次（第三轮，2026-10-18，已完成）
+
+- [x] **usage 重复计数**：`extract_usage_tokens` 对 dict 形态 usage 不再无条件求和——先取 `total_tokens`（缺失再取 `total`）作为总量；两者皆缺时排除总数语义键后只把非布尔数字叶子相加，消除"叶子 + 总数"双重计入（`kernel/engine_evidence.py`）。
+- [x] **只读判定代理带写副作用**：新增 `EventLedger.open_readonly()`——共用初始化但**不截断尾行、不惰性开写句柄、`append()` 抛 `RuntimeError`**；`hooks_assembly` 的判定旁路读取改用该视图，判定对账本零写副作用（`state/ledger.py`、`kernel/hooks_assembly.py`）。
+- [x] **引擎账本句柄泄漏**：`run_flow` 主体包 `try/finally`，异常路径（含身份校验抛错）也关闭账本句柄（`kernel/engine.py`）。
+- [x] **测试辅助句柄卫生（T020p 根因）**：5 个引擎测试类的 `reopened_ledger()` 统一 `addCleanup(ledger.close)`；临时目录清理由 `tearDown` 改为 `setUp` 内 `addCleanup`，保证 LIFO 下"先关账本、后删目录"（否则 Windows 上仍打开的 `ledger.jsonl` 会让 `rmtree` 失败）。
+- 新增测试：`tests/test_ledger_readonly_view.py`（7）+ `tests/test_kernel_engine_ledger_lifecycle.py`（3）+ `tests/test_kernel_usage_accounting.py`（10）＝ **+20**。
+- 验收证据：独立跑 `python -m unittest discover -s tests` → **386 tests OK**；另以 `python -W always::ResourceWarning -m unittest discover -s tests` 复跑，`ResourceWarning: unclosed file` **归零**（"引擎异常路径已释放句柄"以 `os.replace` 成功为主证据，比 ResourceWarning 稳）。
+
 #### 本轮行为变更（面向用户，升级前请读）
 
 - **工作区身份收紧**：由"只拦旧节点消失"改为**严格集合相等**——过去靠同 run 名复用工作区、且节点集不同的用法，升级后启动即拒（退出码 `4`）。
@@ -143,16 +152,16 @@
 | CLI 单一 `except OSError` 误报 | 写盘失败被报成"无法读取流程文件" | `cli.py` |
 | 勾选未到达的人审节点即判 done | 勾选尚未到达 `awaiting_human` 的人审节点会被立即判 done | `kernel/todo_projection.py` |
 | judge 异常后判节点进死胡同 | judge 异常兜底后判定节点无再审路径，resume 不可恢复 | `kernel/engine_node_executors.py`、`kernel/engine_gates.py` |
-| usage 重复计数 | usage 同时含数字叶子与 `total_tokens` 时重复计数 | `kernel/engine_evidence.py` |
-| 只读判定代理带写副作用 | 只读判定代理构造 `EventLedger` 会截断账本尾行 | `kernel/hooks_assembly.py`、`state/ledger.py` |
-| 引擎账本句柄泄漏 | `run_flow` 抛异常时内部账本句柄不关闭（测试可见 `ResourceWarning: unclosed file ledger.jsonl`） | `kernel/engine.py` |
+| usage 重复计数（✅ 第三轮已修） | usage 同时含数字叶子与 `total_tokens` 时重复计数 | `kernel/engine_evidence.py` |
+| 只读判定代理带写副作用（✅ 第三轮已修） | 只读判定代理构造 `EventLedger` 会截断账本尾行 | `kernel/hooks_assembly.py`、`state/ledger.py` |
+| 引擎账本句柄泄漏（✅ 第三轮已修） | `run_flow` 抛异常时内部账本句柄不关闭（测试可见 `ResourceWarning: unclosed file ledger.jsonl`） | `kernel/engine.py` |
 | 异常账本身份校验被跳过 | 账本非空但无 `flow_started` 时身份校验跳过、直接放行 | `kernel/engine.py` |
 | 同源同目标多边被幂等合并 | 多条无条件边被幂等键合并，丢失"哪条 when 边走"的审计事实 | `kernel/engine_gates.py` |
 | 恢复增量盲区 | 同进程内"原地改写已确认前缀"不可被增量路径察觉（跨实例首次仍全量、可检出） | `state/ledger.py` |
 | `split_agent_command` 语义边界 | 空参数丢弃的语义将来若需传空参数会变；手写回退实现对病态引号序列与原生可能不一致 | `compiler/mermaid_parser.py` |
 | 测试文件拆分 | 以下测试文件超 ~400 行组织约定，建议纯搬移拆分 | `tests/test_mermaid_parser.py`、`tests/test_compiler_validator.py`、`tests/test_cli.py`、`tests/test_todo_projection.py` |
 
-> **存量台账复核（T020i–T020p）**：逐条复核后**均未关闭**——`T020i` 部分覆盖（见下）、`j/k/l/m/n` 原因未变维持开放、`o/p` 补注（见下）。
+> **存量台账复核（T020i–T020p）**：`i` 部分覆盖（见下）、`j/k/l/m/n` 原因未变维持开放、`o` 维持开放、`p` 已于第三轮随根因修复关闭（见下）。
 
 ### M1 审计遗留（新发现，并入 M2 处理）
 
@@ -164,7 +173,7 @@
 - [ ] **T020m 审计文件名去实例耦合**：审计文件名含进程/实例信息，跨 run 不稳定。
 - [ ] **T020n 内核模块再拆分**：`hooks_assembly.py`（391 行）/ `engine_node_executors.py`（375 行）物理行数偏高，建议把"证据转换"段与 decision 执行器抽为独立模块（均低于 ~400 硬阈值，非阻塞）。
 - [ ] **T020o 测试缺口补齐**：`@pause` 引擎级、闸后停住/恢复的引擎侧直测、`missing_outputs` 分支、T012 桩行为验收、"exit≠0 但产物齐"的语义完成组合，逐条钉桩。（`@pause` 用例按 v2 行尾 HTML 注释形式 `<!-- @pause -->` 钉桩。）
-- [ ] **T020p 测试卫生**：全套偶发 `ResourceWarning: unclosed file … ledger.jsonl`（疑似某测试的只读 ledger 视图未关闭）。（2026-10-16 复核：已定位两条候选根因——`kernel/engine.py` 引擎异常时账本句柄泄漏、`kernel/hooks_assembly.py` 只读判定代理自建 `EventLedger`；两者已登记于本轮台账，待修复后复验。）
+- [x] **T020p 测试卫生**：全套偶发 `ResourceWarning: unclosed file … ledger.jsonl`。（2026-10-16 复核定位两条产品根因：`kernel/engine.py` 引擎异常时账本句柄泄漏、`kernel/hooks_assembly.py` 只读判定代理自建 `EventLedger` 带写副作用。**2026-10-18 两条均已修复**；剩余噪声来自测试辅助 `reopened_ledger()` 未关句柄，已统一 `addCleanup` 并调整清理顺序修掉。复验：`python -W always::ResourceWarning -m unittest discover -s tests` → **386 OK 且 `ResourceWarning` 归零**。）
 
 ---
 
