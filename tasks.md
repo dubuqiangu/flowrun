@@ -138,19 +138,42 @@
 - **`.ps1` 垫片**：由 content 模式改为 path 模式。
 - **新增退出码 `6`**（账本损坏）。
 
+### M1 审计修复批次（第四轮，2026-10-18，已完成）
+
+**编译器/校验层（Lane A）**
+- [x] **`out=` 放行 NTFS ADS**：`out=` 值中出现 `:` 一律编译期拒绝——`file.txt:stream` 既有空 drive、又非绝对路径，故此前躲过盘符/绝对路径判定，却指向同一目录项上的隐藏数据流。该检查**刻意排在盘符检查之后**，`C:\x` 等仍保留原 "must be a relative path" 文案，零回归（`compiler/validator.py`）。
+- [x] **`timeout:` 边可指向 `human`**：拒绝集由 `(join, decision)` 扩为 `(join, decision, human)`——否则超时分支会绕过人审（`compiler/validator.py`）。
+- [x] **数值无上界**：新增 `compiler/limits.py` 集中三个上限并强制生效——`MAX_TIMEOUT_SECONDS = 30 天`（先 `math.isfinite` 拦住"超长数字溢出成 `inf`"）、`MAX_BUDGET_TOKENS = 1e9`、`MAX_RETRY_ATTEMPTS = 99`；**等于上限接受，严格超上界才拒**（`compiler/mermaid_edge_label.py`、`compiler/mermaid_parser.py`）。
+
+**控制面（Lane B）**
+- [x] **CLI 单一 `except OSError` 误报**：读流程文件失败收敛为专用 `FlowFileReadError`（直接继承 `Exception`，非 `OSError` 子类，故与 `except OSError` 无顺序依赖）；`main` 拆两子句——读失败报"无法读取流程文件"，其余 `OSError` 报"工作区写盘失败（账本 / todo / 产物等无法写入）"。退出码仍为 `3`（既有语义表"编译·校验·IO 失败"），**未新增码**（`cli.py`）。
+- [x] **勾选未到达的人审节点即判 done**：`_append_human_resolution` 增加状态门槛——**仅 `awaiting_human` 才落 `human_resolved`**；未到达即勾选不落账、不判 done，并按降噪政策每轮每文件至多一条同类告警（新增 `_warn_category_once`）（`kernel/todo_projection.py`）。
+- 测试前置修正：`tests/test_todo_projection.py` 的 `_prime_ledger_and_write_todo` 原先只落 `flow_started`（H001 实为 `ready`），其断言依赖了上述缺陷行为；现补一条 `human_requested` 使之真处于 `awaiting_human`。**这是补正确前置条件，不是放宽断言**——该文件其余用例（pause/skip/resume/幂等）语义不变，未到达即勾选的拦截另由新测试文件覆盖。
+- 新增测试：`tests/test_compiler_limits.py`（7）+ `tests/test_compiler_out_and_edge_rules.py`（6）+ `tests/test_cli_io_errors.py`（3）+ `tests/test_todo_projection_human_guard.py`（4）＝ **+20**。
+- 验收证据：独立跑 `python -m unittest discover -s tests` → **406 tests OK**；`-W always::ResourceWarning` 复跑 406 OK 且 `ResourceWarning` **归零**。两条修复线各自做了"回退即变红"验证：编译侧 7 条拒绝类用例全红、控制面 3 条红（写盘误报 / 未到达即勾选 ×2）。
+- 集成期发现的两处工具链噪声（已修，非产品缺陷）：Lane A 把三个既有源文件整体翻成 CRLF（索引仍是 LF），已归一为 LF，真实改动收敛为 +50/−6；PowerShell 的 `Measure-Object -Line` **跳过空行**，导致此前全仓行数低估约 15%（口径修正见下）。
+
+#### 本轮行为变更（面向用户，升级前请读）
+
+- **`out=` 含 `:` 现在编译报错**：过去 `out=a.txt:stream`（NTFS 备用数据流）能通过。
+- **`timeout:` 边不再允许指向人审节点**：过去可用，升级后编译报错（超时分支会绕过人审）。
+- **数值上限生效**：`timeout` > 30 天、`budget_tokens` > 10^9、`retry` > 99 一律编译报错。
+- **勾选未到达的人审节点不再判 done**：过去会被立即判 done（等于伪造人审通过），现在忽略并给一条告警。
+- **CLI IO 失败文案分诊**：读流程文件失败与工作区写盘失败现在给不同诊断文案（退出码都仍是 `3`）。
+
 ### M1 审计遗留（第二轮新发现，并入 M2 处理）
 
 | 条目 | 现象 | 位置 |
 |---|---|---|
-| out= 放行 NTFS ADS | `a.txt:stream` 形式未被拦（非路径逃逸，但可指同目录数据流） | `compiler/validator.py` |
+| out= 放行 NTFS ADS（✅ 第四轮已修） | `a.txt:stream` 形式未被拦（非路径逃逸，但可指同目录数据流） | `compiler/validator.py` |
 | cmd 垫片参数级注入面 | 模板参数本身含 `&`/`%`/`"` 时仍被 cmd.exe 重分词（暴露面与修复前同级，未新增） | `adapters/base.py` 启动计划 |
 | shell 命令头 content 模式理论绕过 | `cmd`/`powershell` 命令头走 content 模式的理论绕过面（默认多行 packet 不可触发） | `adapters/base.py` 注入模式判定 |
 | path 模式不中和 `%VAR%` | 仅当工作区路径含 `%…%` 时暴露 | `adapters/base.py` |
-| 数值无上界 | `timeout` 可溢出为 `inf`；`budget_tokens`/`retry` 无上限 | `compiler/mermaid_edge_label.py`、`compiler/mermaid_parser.py` |
-| `timeout:` 边可指向 `human` | 现只拒 join/decision | `compiler/validator.py` |
+| 数值无上界（✅ 第四轮已修） | `timeout` 可溢出为 `inf`；`budget_tokens`/`retry` 无上限 | `compiler/limits.py`（新增）、`compiler/mermaid_edge_label.py`、`compiler/mermaid_parser.py` |
+| `timeout:` 边可指向 `human`（✅ 第四轮已修） | 现只拒 join/decision | `compiler/validator.py` |
 | 退出码 `2` 无生产者 | M1 无 `flow_halted`/`checkpoint` 写入方，`is_halted()` 恒 False、相关分支为死代码 | `cli.py`、`state/flow_state.py` |
-| CLI 单一 `except OSError` 误报 | 写盘失败被报成"无法读取流程文件" | `cli.py` |
-| 勾选未到达的人审节点即判 done | 勾选尚未到达 `awaiting_human` 的人审节点会被立即判 done | `kernel/todo_projection.py` |
+| CLI 单一 `except OSError` 误报（✅ 第四轮已修） | 写盘失败被报成"无法读取流程文件" | `cli.py` |
+| 勾选未到达的人审节点即判 done（✅ 第四轮已修） | 勾选尚未到达 `awaiting_human` 的人审节点会被立即判 done | `kernel/todo_projection.py` |
 | judge 异常后判节点进死胡同 | judge 异常兜底后判定节点无再审路径，resume 不可恢复 | `kernel/engine_node_executors.py`、`kernel/engine_gates.py` |
 | usage 重复计数（✅ 第三轮已修） | usage 同时含数字叶子与 `total_tokens` 时重复计数 | `kernel/engine_evidence.py` |
 | 只读判定代理带写副作用（✅ 第三轮已修） | 只读判定代理构造 `EventLedger` 会截断账本尾行 | `kernel/hooks_assembly.py`、`state/ledger.py` |
@@ -159,7 +182,9 @@
 | 同源同目标多边被幂等合并 | 多条无条件边被幂等键合并，丢失"哪条 when 边走"的审计事实 | `kernel/engine_gates.py` |
 | 恢复增量盲区 | 同进程内"原地改写已确认前缀"不可被增量路径察觉（跨实例首次仍全量、可检出） | `state/ledger.py` |
 | `split_agent_command` 语义边界 | 空参数丢弃的语义将来若需传空参数会变；手写回退实现对病态引号序列与原生可能不一致 | `compiler/mermaid_parser.py` |
-| 测试文件拆分 | 以下测试文件超 ~400 行组织约定，建议纯搬移拆分 | `tests/test_mermaid_parser.py`、`tests/test_compiler_validator.py`、`tests/test_cli.py`、`tests/test_todo_projection.py` |
+| 文件超 ~400 行待拆分（✅ 已入结构拆分批次） | 真实行数超线的既有文件（口径已修正，见下）：`tests/` 5 个 + 2 个 `src` 文件；建议纯搬移拆分、行为零变化 | `tests/test_cli.py`(779)、`tests/test_mermaid_parser.py`(577)、`tests/test_compiler_validator.py`(531)、`tests/test_ledger.py`(499)、`tests/test_todo_projection.py`(463)、`src/flowrun/kernel/todo_projection.py`(457)、`src/flowrun/cli.py`(451)、`tests/test_kernel_engine_gates.py`(428)、`tests/test_kernel_judge.py`(424) |
+
+> **行数口径修正（2026-10-18）**：此前用 PowerShell `Measure-Object -Line` 统计，该 cmdlet **跳过空行**，全仓行数被低估约 15%（例：`cli.py` 记 360、实为 451）。改用字节级 `splitlines()` 重测后得左侧真实清单。第四轮起，新代码一律落到新模块/新测试文件（`compiler/limits.py`、`test_compiler_limits.py`、`test_cli_io_errors.py`、`test_todo_projection_human_guard.py`），未再给超线文件加厚。
 
 > **存量台账复核（T020i–T020p）**：`i` 部分覆盖（见下）、`j/k/l/m/n` 原因未变维持开放、`o` 维持开放、`p` 已于第三轮随根因修复关闭（见下）。
 

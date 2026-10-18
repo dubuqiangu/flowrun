@@ -117,6 +117,11 @@ class TodoProjectionTestCase(unittest.TestCase):
             {"entry_nodes": ["H001"], "planned_nodes": ["T001", "T002"]},
             "run-flow-started", self.flow_ir.run_name,
         )
+        # H001 必须先收到 human_requested 才是 awaiting_human——只有此时勾选才被接受
+        # （未走到人审即勾选的拦截见 tests/test_todo_projection_human_guard.py）。
+        self.ledger.append(
+            "human_requested", {}, "run-H001-request-1", self.flow_ir.run_name, "H001"
+        )
         self.ledger.append("node_done", {}, "run-T002-done-1", self.flow_ir.run_name, "T002")
         write_todo(self.flow_ir, self.ledger.replay(), self.todo_path)
 

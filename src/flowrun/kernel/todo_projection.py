@@ -153,6 +153,9 @@ def apply_user_marks(
     也不重复告警——派生勾选行（``[x]`` + ``<!-- done -->``）重跑时静默跳过。每落一条
     事件都同步投影进传入的 flow_state，调用方无需重放即可看到最新状态。todo 文件
     缺失时静默返回 0（无可应用的输入）。
+
+    人审勾选门槛：只有状态为 ``awaiting_human`` 的人审节点，勾选才落 human_resolved；
+    未到达即勾选一律拒绝（不落账、不判 done），并按降噪政策每轮每文件至多一条同类告警。
     """
     todo_path = Path(todo_path)
     try:
@@ -161,13 +164,15 @@ def apply_user_marks(
         return 0
     marks, marked_node_ids = _parse_marked_nodes(todo_text)
     applied_event_count = 0
+    # 本轮每文件已发过的告警类别：同类告警只发一条（降噪政策，参 T020c）。
+    warned_categories: set[str] = set()
     for mark in marks:
         node_spec = flow_ir.nodes.get(mark.node_id)
         if node_spec is None:
             _warn(f"todo 行引用了流程图之外的节点 {mark.node_id}，忽略（勿增删节点行）")
             continue
         applied_event_count += _apply_single_mark(
-            flow_ir, node_spec, mark, ledger, flow_state
+            flow_ir, node_spec, mark, ledger, flow_state, warned_categories
         )
     if any(mark.resume_directive for mark in marks):
         applied_event_count += _apply_resume_request(flow_ir, ledger, flow_state)
@@ -302,6 +307,7 @@ def _apply_single_mark(
     mark: TodoNodeMark,
     ledger: EventLedger,
     flow_state: FlowState,
+    warned_categories: set[str],
 ) -> int:
     """对单个节点应用其 todo 节点级标记（勾选 / @pause / @skip），返回新落账事件数。
 
@@ -327,7 +333,7 @@ def _apply_single_mark(
                 )
         else:
             applied_event_count += _append_human_resolution(
-                flow_ir, node_spec, ledger, flow_state
+                flow_ir, node_spec, ledger, flow_state, warned_categories
             )
     return applied_event_count
 
@@ -380,10 +386,27 @@ def _append_human_resolution(
     node_spec,
     ledger: EventLedger,
     flow_state: FlowState,
+    warned_categories: set[str],
 ) -> int:
-    """人审节点勾选 → human_resolved(approve)；节点已 done 则幂等跳过。"""
+    """人审节点勾选 → human_resolved(approve)，**仅当节点确实处于 awaiting_human**。
+
+    改前只要节点不是 done 就落 human_resolved——勾选一个尚未走到的人审节点会立即
+    把它判 done（伪造人审通过）。现况守卫：
+    - 节点已 done：幂等跳过（派生 [x] 行重跑静默，无告警）；
+    - 节点非 awaiting_human：拒绝落账、不产生 human_resolved 伪事件，并按降噪政策
+      每轮每文件至多一条同类告警（不逐行刷屏）。
+    """
     node_id = node_spec.node_id
-    if flow_state.node_status(node_id) == STATUS_DONE:
+    node_status = flow_state.node_status(node_id)
+    if node_status == STATUS_DONE:
+        return 0
+    if node_status != STATUS_AWAITING_HUMAN:
+        _warn_category_once(
+            warned_categories,
+            "human-check-before-review",
+            f"节点 {node_id} 尚未到达人审挂起点（当前 {node_status}），勾选被忽略——"
+            "只有状态为 awaiting_human 的人审节点，勾选才生效",
+        )
         return 0
     resolution_count = _count_ledger_events(ledger, "human_resolved", node_id)
     appended_entry = ledger.append(
@@ -422,3 +445,13 @@ def _count_directive_events(
 def _warn(message: str) -> None:
     """增删节点行等用户误操作：忽略但向 stderr 告警（design.md §4.2）。"""
     print(f"[todo_projection] 告警: {message}", file=sys.stderr)
+
+
+def _warn_category_once(
+    warned_categories: set[str], warning_category: str, message: str
+) -> None:
+    """同类告警每轮每文件至多一条（降噪政策，参 T020c）：本轮该类别已发过则静默。"""
+    if warning_category in warned_categories:
+        return
+    warned_categories.add(warning_category)
+    _warn(message)

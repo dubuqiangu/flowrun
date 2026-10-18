@@ -7,8 +7,10 @@ line number.
 
 from __future__ import annotations
 
+import math
 import re
 
+from flowrun.compiler.limits import MAX_RETRY_ATTEMPTS, MAX_TIMEOUT_SECONDS
 from flowrun.compiler.mermaid_errors import MermaidParseError
 
 WHEN_ALL = "all"
@@ -69,6 +71,13 @@ def parse_edge_label(
                     line_number,
                 )
             retry_count = int(label_value)
+            if retry_count > MAX_RETRY_ATTEMPTS:
+                raise MermaidParseError(
+                    f"retry count {retry_count} exceeds the maximum of "
+                    f"{MAX_RETRY_ATTEMPTS} ('retry:' must stay within a "
+                    "two-digit attempt budget)",
+                    line_number,
+                )
         elif label_key == "timeout":
             timeout_seconds = parse_timeout_duration(label_value, line_number)
         else:
@@ -80,7 +89,12 @@ def parse_edge_label(
 
 
 def parse_timeout_duration(label_value: str, line_number: int) -> float:
-    """Parse '30m' / '45s' / '2h' / '90' into seconds; the value must be > 0."""
+    """Parse '30m' / '45s' / '2h' / '90' into seconds.
+
+    The value must be finite, greater than 0, and at most MAX_TIMEOUT_SECONDS:
+    an all-digit value long enough to overflow ``float()`` becomes ``inf``, and
+    an infinite timeout never fires.
+    """
     timeout_match = _TIMEOUT_PATTERN.fullmatch(label_value)
     if timeout_match is None:
         raise MermaidParseError(
@@ -90,10 +104,22 @@ def parse_timeout_duration(label_value: str, line_number: int) -> float:
         )
     amount_text, unit_text = timeout_match.groups()
     timeout_seconds = float(amount_text) * _TIMEOUT_UNIT_SECONDS[unit_text]
+    if not math.isfinite(timeout_seconds):
+        raise MermaidParseError(
+            f"invalid timeout duration '{label_value}': the value is not a finite "
+            f"number (it overflows the supported range, max {MAX_TIMEOUT_SECONDS}s)",
+            line_number,
+        )
     if timeout_seconds <= 0:
         raise MermaidParseError(
             f"invalid timeout duration '{label_value}': must be greater than 0 "
             "(a zero timeout fires before the node can make progress)",
+            line_number,
+        )
+    if timeout_seconds > MAX_TIMEOUT_SECONDS:
+        raise MermaidParseError(
+            f"timeout duration '{label_value}' exceeds the maximum of "
+            f"{MAX_TIMEOUT_SECONDS} seconds ({MAX_TIMEOUT_SECONDS // 86400} days)",
             line_number,
         )
     return timeout_seconds

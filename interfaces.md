@@ -14,22 +14,31 @@
 
 ```
 flowrun/
-├── design.md / tasks.md / interfaces.md      # orchestrator
+├── README.md / LICENSE / design.md / tasks.md / interfaces.md   # orchestrator
 ├── src/flowrun/
-│   ├── ir/schema.py            # 域A：IR 数据结构（全项目地基）
+│   ├── ir/schema.py             # 域A：IR 数据结构（全项目地基）
 │   ├── compiler/
-│   │   ├── mermaid_parser.py   # 域A：flow.mmd → 原始解析树
-│   │   └── validator.py       # 域A：解析树 → FlowIR + 校验错误(带行号)
+│   │   ├── frontmatter.py       # 域A：frontmatter 剥离 + 严格解析（引号/重复键/行内注释）
+│   │   ├── mermaid_syntax.py    # 域A：单行 tokenize + 节点/边 token 解析
+│   │   ├── mermaid_edge_label.py # 域A：边标签 when / retry / timeout 解析
+│   │   ├── mermaid_errors.py    # 域A：MermaidParseError（带 Mermaid 行号）
+│   │   ├── mermaid_parser.py    # 域A：flow.mmd → 原始解析树
+│   │   ├── limits.py            # 域A：编译期数值上限（timeout / budget_tokens / retry）
+│   │   └── validator.py         # 域A：解析树 → FlowIR + 校验错误(带行号)
 │   ├── state/
-│   │   ├── ledger.py           # 域B：事件账本
-│   │   └── snapshots.py        # 域B：快照与恢复
+│   │   ├── ledger.py            # 域B：事件账本
+│   │   ├── flow_state.py        # 域B：重放投影 + 幂等去重
+│   │   └── snapshots.py         # 域B：快照与恢复
 │   ├── adapters/
-│   │   ├── base.py             # 域C：适配器接口 + 双信号退出监视器
-│   │   ├── registry.py         # 域C：声明式注册 + which 探测
-│   │   ├── claude_code.py      # 域C
-│   │   └── opencode_cli.py     # 域C
-│   ├── kernel/                 # 域D（M1 第二批）：engine/judge/todo_projection/stub_generator
+│   │   ├── base.py              # 域C：适配器接口 + 双信号退出监视器
+│   │   ├── registry.py          # 域C：声明式注册 + which 探测 + 注入模式
+│   │   ├── claude_code.py       # 域C
+│   │   └── opencode_cli.py      # 域C
+│   ├── kernel/                  # 域D：engine / engine_gates / engine_node_executors /
+│   │                            #     engine_graph / engine_evidence / hooks_assembly /
+│   │                            #     judge / packet_builder / stub_generator / todo_projection
 │   └── cli.py                   # 域D 最后装配
+├── scripts/verify-install.ps1   # 发布门禁：GitHub 直装自验证
 ├── tests/                       # 各域自带测试文件
 └── examples/flow.mmd            # 域A 维护
 ```

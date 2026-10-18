@@ -22,6 +22,8 @@ argparse 子命令 → 各域模块调用的薄装配层，不承载业务逻辑
 0=done / 1=waiting(paused/awaiting_human) / 2=halted /
 3=编译·校验·IO 失败 / 4=工作区与流程身份不匹配 / 5=工作区未初始化 /
 6=账本损坏（ledger 中段不可解析或哈希链断裂，需人工检查或换新工作区）。
+其中 3 同时覆盖"读流程文件失败"与"工作区写盘失败（账本 / todo / 产物等）"两种
+IO 失败——两者诊断文案不同（前者标明读流程文件，后者标明写盘）。
 
 异步入口统一 ``asyncio.run``（仅标准库）。所有对外输入只进结构化解析。
 """
@@ -72,6 +74,14 @@ EXIT_WORKSPACE_MISSING = 5
 EXIT_LEDGER_CORRUPTION = 6
 
 
+class FlowFileReadError(Exception):
+    """读取流程文件（flow.mmd）失败——单独成类，使 main 能把"读流程文件失败"
+    与"工作区写盘失败"两类 OSError 分开报（改前统一误报成"无法读取流程文件"）。
+
+    与 OSError 无继承关系（直接继承 Exception），故 main 的 except 子句顺序无关。
+    """
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI 入口：解析参数并执行子命令，返回进程退出码。"""
     parser = build_argument_parser()
@@ -88,17 +98,27 @@ def main(argv: list[str] | None = None) -> int:
     except (MermaidParseError, FrontmatterError) as parse_error:
         print(f"flow.mmd:{parse_error}", file=sys.stderr)
         return EXIT_COMPILE_ERROR
-    # LedgerCorruptionError 与 OSError 分属两条无继承关系的异常树（前者直接继承
-    # Exception），故本子句无论放在 OSError 之前还是之后都拦得住——放在前面只因
-    # "更具体的业务语义"优先，代码不依赖两个子句的先后顺序。
+    # 三个子句分属互无继承关系的异常树：LedgerCorruptionError 与 FlowFileReadError
+    # 都直接继承 Exception（不是 OSError 子类），故不会被 except OSError 抢先捕获，
+    # 先后顺序不影响正确性；把它们排在 OSError 之前只为"更具体的业务语义"优先。
     except LedgerCorruptionError as ledger_corruption_error:
         print(
             f"flowrun: {_describe_ledger_corruption(ledger_corruption_error, parsed_args)}",
             file=sys.stderr,
         )
         return EXIT_LEDGER_CORRUPTION
-    except OSError as io_error:
-        print(f"flowrun: 无法读取流程文件 - {io_error}", file=sys.stderr)
+    except FlowFileReadError as flow_file_read_error:
+        print(f"flowrun: 无法读取流程文件 - {flow_file_read_error}", file=sys.stderr)
+        return EXIT_COMPILE_ERROR
+    except OSError as workspace_write_error:
+        # 读流程文件已在上方收敛为 FlowFileReadError，故此处剩余的 OSError 都来自
+        # 工作区写入路径（账本 / todo / packet / AGENTS.stub 等）——按此措辞诊断，
+        # 不再误报成"无法读取流程文件"。退出码沿用 3（既有语义表：编译·校验·IO 失败）。
+        print(
+            f"flowrun: 工作区写盘失败（账本 / todo / 产物等无法写入）- "
+            f"{workspace_write_error}",
+            file=sys.stderr,
+        )
         return EXIT_COMPILE_ERROR
 
 
@@ -312,8 +332,16 @@ def _handle_todo(parsed_args: argparse.Namespace) -> int:
 
 
 def _compile_flow_file(flow_path: Path) -> FlowIR:
-    """读文件并走完整编译管线（坏图由 main 统一捕获打印）。"""
-    flow_source = Path(flow_path).read_text(encoding="utf-8")
+    """读文件并走完整编译管线（坏图由 main 统一捕获打印）。
+
+    读取失败单独收敛为 FlowFileReadError，使 main 能把"读流程文件失败"与"工作区
+    写盘失败"分开诊断（改前两者都落进同一个 except OSError，统一误报成读取失败）。
+    """
+    flow_path = Path(flow_path)
+    try:
+        flow_source = flow_path.read_text(encoding="utf-8")
+    except OSError as flow_read_error:
+        raise FlowFileReadError(f"{flow_path}：{flow_read_error}") from flow_read_error
     return compile_flow_source(flow_source)
 
 

@@ -8,9 +8,10 @@ Implements tasks.md T003:
   nodes may have no contract)
 - 'out=' paths must stay inside the workspace: relative, no '..' segments,
   no drive letter / absolute path / root-relative form (a leading path
-  separator resolves against the drive root, not the workspace) (a path
-  outside the workspace turns the existence check into an oracle and lets an
-  external file satisfy the contract)
+  separator resolves against the drive root, not the workspace), and no ':'
+  (NTFS alternate data streams address a hidden stream on the same entry) (a
+  path outside the workspace turns the existence check into an oracle and lets
+  an external file satisfy the contract)
 - node agent= references must exist in the frontmatter agent registry
 - decision nodes need at least one outgoing edge with a non-'all' 'when:' condition
 - self-loop edges (source == target) are rejected
@@ -32,6 +33,7 @@ from flowrun.compiler.mermaid_parser import (
 )
 from flowrun.ir.schema import (
     NODE_KIND_DECISION,
+    NODE_KIND_HUMAN,
     NODE_KIND_JOIN,
     NODE_KIND_TASK,
     EdgeSpec,
@@ -259,12 +261,12 @@ def _report_timeout_edge_violations(
             target_kind = (
                 NODE_KIND_JOIN if edge.target_id in join_node_ids else target_node.shape
             )
-            if target_kind in (NODE_KIND_JOIN, NODE_KIND_DECISION):
+            if target_kind in (NODE_KIND_JOIN, NODE_KIND_DECISION, NODE_KIND_HUMAN):
                 report(
                     edge.line_number,
                     f"'timeout:' edge to '{edge.target_id}' must not target a "
                     f"'{target_kind}' node: the timeout path would bypass the "
-                    "barrier / judge",
+                    "barrier / judge / approval",
                 )
         if edge.retry > 0:
             report(
@@ -304,6 +306,15 @@ def _describe_invalid_output_path(output_path: str) -> str | None:
         or bool(windows_path.root)
     ):
         return "must be a relative path (absolute paths escape the workspace)"
+    if ":" in output_path:
+        # NTFS alternate data stream: 'a.txt:stream' has no drive and is not
+        # absolute, yet it names a hidden stream on the same directory entry.
+        # This check sits after the drive test on purpose, so 'C:\\x' keeps its
+        # 'must be a relative path' message (no regression).
+        return (
+            "must not contain ':' (an NTFS alternate data stream such as "
+            "'file.txt:stream' hides data on the same file entry)"
+        )
     normalized_parts = PurePosixPath(output_path.replace("\\", "/")).parts
     if ".." in normalized_parts:
         return "must not contain '..' path segments (they escape the workspace)"

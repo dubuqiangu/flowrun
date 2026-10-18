@@ -28,6 +28,7 @@ from flowrun.compiler.frontmatter import (
     parse_frontmatter_document,
     separate_frontmatter,
 )
+from flowrun.compiler.limits import MAX_BUDGET_TOKENS
 from flowrun.compiler.mermaid_syntax import (
     MermaidParseError,
     ParsedEdge,
@@ -326,6 +327,12 @@ def _extract_flow_metadata(
                     "frontmatter 'defaults.budget_tokens' must be greater than 0 "
                     f"(got {budget_entry}); a non-positive budget trips the token gate "
                     "on the very first hop",
+                    key_lines.get("defaults", 1),
+                )
+            if budget_entry > MAX_BUDGET_TOKENS:
+                raise MermaidParseError(
+                    "frontmatter 'defaults.budget_tokens' must be at most "
+                    f"{MAX_BUDGET_TOKENS} tokens (got {budget_entry})",
                     key_lines.get("defaults", 1),
                 )
             budget_tokens = budget_entry
