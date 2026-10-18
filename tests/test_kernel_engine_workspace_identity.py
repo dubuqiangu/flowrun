@@ -154,8 +154,15 @@ class WorkspaceIdentityTestCase(unittest.TestCase):
         self.assertTrue(second_state.is_done())
         self.assertEqual(len(self.reopened_ledger().entries()), events_after_first_run)
 
-    def test_missing_planned_nodes_only_checks_run_name(self) -> None:
-        """K2 兼容边界：老账本 / 手写夹具 payload 缺 planned_nodes → 只校验 run 名。"""
+    def test_missing_planned_nodes_is_rejected(self) -> None:
+        """缺陷 1（fail-closed）：老账本 / 手写夹具 payload 缺 planned_nodes → 拒绝。
+
+        旧行为"只校验 run 名"是 fail-open：无计划节点集可比时身份无从校验，
+        同名但另一张图的流程可以绕过身份校验续跑上去。现改为"无法校验即拒绝"，
+        诊断须指明缺 planned_nodes 并建议换新工作区。
+
+        说明：这是**纠正前置条件**（把"跳过校验"改成"拒绝"），不是放宽断言——
+        被纠正的正是旧断言所钉住的宽松行为。"""
         flow_ir = support.make_flow_ir([support.make_node("T001")], [])
         seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
         seeded_ledger.append(
@@ -166,7 +173,10 @@ class WorkspaceIdentityTestCase(unittest.TestCase):
         )
         seeded_ledger.close()
 
-        verify_workspace_matches_flow(flow_ir, self.reopened_ledger())  # 不抛
+        with self.assertRaises(FlowWorkspaceMismatchError) as raised_context:
+            verify_workspace_matches_flow(flow_ir, self.reopened_ledger())
+        self.assertIn("planned_nodes", str(raised_context.exception))
+        self.assertIn("换新工作区", str(raised_context.exception))
 
         foreign_run_flow = support.make_flow_ir(
             [support.make_node("T001")], [], run_name="other-release-flow"

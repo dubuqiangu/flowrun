@@ -11,6 +11,9 @@
 ``FlowWorkspaceMismatchError``（CLI 捕获后退 4）——防止
 ``flowrun run b.mmd --workspace a的工作区`` 恢复出 A 的 flow_done 后立刻宣告
 完成、把 B 整图静默跳过，也防止"新图追加节点"静默继承旧 run 的 done。
+FAIL-CLOSED：**一切"无法校验身份"的情形都拒绝**而非放行——账本非空却
+缺 flow_started、flow_started 的 planned_nodes 缺失或为空，都与集合不等价
+同等对待（同样抛异常、退 4、零写入），旧实现这两处直接跳过即 fail-open 漏洞。
 
 主循环每轮（任务书 T010 冻结顺序；②③ 于 FIX-B2 换序）：
 ① 恢复 FlowState；running 节点视为上次进程中断 → 落 node_failed
@@ -66,10 +69,11 @@ from .engine_gates import (
     count_node_events,
     find_untripped_machine_gates,
     has_edge_been_taken,
-    outgoing_unconditional_targets,
+    outgoing_activatable_edges,
     resolve_failed_node_policy,
     trip_gate,
 )
+from .engine_graph import first_timeout_edge
 from .engine_node_executors import advance_ready_nodes
 from .todo_projection import write_todo
 
@@ -247,24 +251,29 @@ def verify_workspace_matches_flow(flow_ir: FlowIR, ledger: EventLedger) -> None:
     零写入纯查询：只读账本，不落事件、不建目录、不改文件；可直接在**已打开的**
     ``EventLedger`` 上调用。
 
-    校验规则（用户裁定：**严格集合相等**）：
-    - 空账本 = 全新工作区，无需校验；
-    - 账本非空时以其中 ``flow_started`` 为身份真相来源：run 名必须一致，且其
-      ``planned_nodes`` 与当前图节点集必须**双向一致**——多出一个节点、或少了
-      一个节点都拒绝（"换图请换工作区"）。旧实现只拦"工作区既有节点消失"，
-      新图是超集时放行，叠加"已 done 的 run 直接返回"，会让追加进来的节点
-      静默继承旧 run 的 flow_done 而永不执行。
+    校验规则（用户裁定：**严格集合相等**，fail-closed）：
+    - **空账本 = 全新工作区**，放行（首次 run 随后落 flow_started）；
+    - 账本非空但**没有 flow_started** → 拒绝：这不是内核生成的合法工作区，
+      身份无从校验——旧实现直接跳过，于是一个手工写入/陈旧账本可以绕过身份
+      校验，把**另一张图**续跑上去（fail-open 漏洞）；
+    - flow_started 的 **planned_nodes 缺失或为空** → 拒绝：无计划节点集可比，
+      身份无从校验——旧实现只认 run 名，同名的另一张图即可绕过；
+    - planned_nodes 与当前图节点集必须**双向一致**：多出一个节点、或少一个
+      节点都拒绝（"换图请换工作区"）。
 
-    兼容边界（老账本 / 手写夹具）：``flow_started`` 的 payload **缺失或为空**
-    ``planned_nodes`` 时**跳过节点集校验**，只校验 run 名——否则既有夹具会被
-    全部打死。账本非空却查不到 ``flow_started``（异常账本）时不拦，交由后续
-    恢复路径处置。
+    两种"无法校验"的情形都退 4（``FlowWorkspaceMismatchError`` → CLI 退出码 4），
+    诊断文案给出原因与可执行建议；校验仍在一切写入之前、零写入。
     """
+    if ledger.last_seq == 0:
+        return  # 空账本 = 全新工作区：无身份可校验，放行首次 run
     flow_started_entry = next(
         (entry for entry in ledger.entries() if entry.type == "flow_started"), None
     )
     if flow_started_entry is None:
-        return
+        raise FlowWorkspaceMismatchError(
+            "账本非空但缺少 flow_started 事件，无法校验工作区身份"
+            "（这不是内核生成的合法工作区）；请换新工作区"
+        )
     recorded_run_name = flow_started_entry.run
     if recorded_run_name != flow_ir.run_name:
         raise FlowWorkspaceMismatchError(
@@ -273,7 +282,10 @@ def verify_workspace_matches_flow(flow_ir: FlowIR, ledger: EventLedger) -> None:
         )
     recorded_planned_nodes = set(flow_started_entry.payload.get("planned_nodes") or [])
     if not recorded_planned_nodes:
-        return  # 兼容边界：无计划节点可校验，只认 run 名
+        raise FlowWorkspaceMismatchError(
+            "账本 flow_started 缺少 planned_nodes（计划节点集为空），无法校验工作区身份；"
+            "请换新工作区"
+        )
     current_node_ids = set(flow_ir.nodes)
     replaced_node_ids = recorded_planned_nodes - current_node_ids
     if replaced_node_ids:
@@ -312,8 +324,9 @@ def activate_finished_nodes(
 ) -> None:
     """⑤：对每个 done/skipped 节点激活其无条件边与 barrier 边（跨轮幂等）。
 
-    边幂等键 = run-edge-source-target：同一对节点间的自动激活只发生一次
-    （重试重跑同一节点后，其出边不会对同一目标二次投递——防自动边循环）。
+    边幂等键按**边身份**单射（``run-edge-<index>-<source>-><target>-<kind>``）：
+    同源同目标的多条边各自独立，一条激活不影响另一条；同一条边重复激活才被
+    幂等拦下（重试重跑同一节点后，其出边不会对同一目标二次投递——防自动边循环）。
     failed 节点交给 engine_gates 的处置策略：超时分支 / 重新入队 / retry 闸。
     skipped 节点视同 done 激活后继——"@skip 跳过该节点"意指绕过而非拦断
     全流（记事件不改图，design.md §5.1）。
@@ -325,16 +338,15 @@ def activate_finished_nodes(
     节点重新点燃；失败节点也不得被晚到入边退回 ready（它的重投只走
     ``node_entered``，见 ``_apply_failure_policy``）。
     """
-    run_name = flow_ir.run_name
     for node_id in flow_ir.nodes:
         node_status = flow_state.node_status(node_id)
         if node_status in (STATUS_DONE, STATUS_SKIPPED):
-            for target_id, when_text in outgoing_unconditional_targets(flow_ir, node_id):
-                if not edge_taken_may_activate_target(flow_state.node_status(target_id)):
+            for edge in outgoing_activatable_edges(flow_ir, node_id):
+                if not edge_taken_may_activate_target(flow_state.node_status(edge.target_id)):
                     continue  # target 已终态：边不再激活（投影只前进不后退）
-                if has_edge_been_taken(ledger, run_name, node_id, target_id):
+                if has_edge_been_taken(ledger, flow_ir, edge):
                     continue
-                append_edge_taken(ledger, run_name, node_id, target_id, when_text)
+                append_edge_taken(ledger, flow_ir, edge, edge.when)
         elif node_status == STATUS_FAILED:
             _apply_failure_policy(flow_ir, ledger, node_id)
 
@@ -350,10 +362,9 @@ def _apply_failure_policy(
     run_name = flow_ir.run_name
     failure_policy = resolve_failed_node_policy(flow_ir, ledger, node_id)
     if failure_policy.action == FAILURE_ACTION_TIMEOUT_BRANCH:
-        if not has_edge_been_taken(ledger, run_name, node_id, failure_policy.timeout_target_id):
-            append_edge_taken(
-                ledger, run_name, node_id, failure_policy.timeout_target_id, None
-            )
+        timeout_edge = first_timeout_edge(flow_ir, node_id)
+        if timeout_edge is not None and not has_edge_been_taken(ledger, flow_ir, timeout_edge):
+            append_edge_taken(ledger, flow_ir, timeout_edge, None)
     elif failure_policy.action == FAILURE_ACTION_REQUEUE:
         requeue_occurrence = count_node_events(ledger, "node_entered", node_id) + 1
         ledger.append(

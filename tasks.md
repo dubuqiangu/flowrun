@@ -161,25 +161,50 @@
 - **勾选未到达的人审节点不再判 done**：过去会被立即判 done（等于伪造人审通过），现在忽略并给一条告警。
 - **CLI IO 失败文案分诊**：读流程文件失败与工作区写盘失败现在给不同诊断文案（退出码都仍是 `3`）。
 
+### M1 审计修复批次（第五轮，2026-10-18，已完成）
+
+**适配层注入面（Lane C）**
+- [x] **cmd 垫片参数级注入面**：把 `subprocess.list2cmdline` 换成集中渲染器 `render_cmd_exe_arguments`（新增 `adapters/cmd_line_safety.py`）——**每个参数无条件加双引号**，`&` / `|` / `^` / `<` / `>` / 空白 一律失活。**刻意不采用"仅含元字符时才加引号"**：安全关键渲染不应依赖"元字符枚举是否完整"，漏一个字符注入面就回来了。
+- [x] **path 模式不中和 `%VAR%`**：`%` 在 cmd.exe 里**即使位于双引号内也会展开**，`%%` 也非命令行层面的可靠转义 → 只能**失败关闭**：参数含 `%` / `"` / CR / LF 时拒绝执行并抛 `CmdExeUnsafeArgumentError`（文案给出"把工作区移到不含 `%` 的路径"的可执行建议）。**边界**：直接经 `CreateProcess` 启动的进程（`.exe`、`powershell -File`）不做此限制——那里 `%` 是字面量，不误伤。
+- [x] **shell 命令头 content 模式理论绕过**：命令头是已知 shell（`cmd` / `cmd.exe` / `powershell(.exe)` / `pwsh(.exe)` / `sh(.exe)` / `bash(.exe)`，按**文件名**判定、忽略目录与大小写）+ content 注入 → **编译期拒绝**（`ShellCommandHeadContentInjectionError`）。**不自动改 path 模式**：把 packet 路径喂给一个 shell 会试图执行它，比拒绝更危险。前端**没有开关**可配（注入模式是从命令头**派生**的）。
+  - 判定在 `adapters/registry.py`（`require_safe_injection_for_declared_agent` / 整表入口 `validate_agent_injection_policy`），报告在 `compiler/validator.py`（逐 agent 收集为 `ValidationError`，退出码 `3`）——使"拿到 FlowIR ⇒ 注入策略已校验"成为真不变量，`compile`/`run`/`resume` 全都受益，且拒绝发生在**任何写入之前**。
+  - **性能口径**：`resolve_injection_mode` 含一次有界 PATH 扫描（**实测 51ms/次**未命中、26ms/次命中），故先做**纯名字预筛**（`is_known_shell_command_head`，零探测），只有确为 shell 命令头才解析注入模式——正常 agent（claude / opencode）零代价。实测加固后编译耗时 **0.071ms/次**，与加固前 0.073ms/次持平。
+
+**内核（Lane D）**
+- [x] **异常账本身份校验被跳过**：`verify_workspace_matches_flow` 由 fail-open 改 **fail-closed**——账本非空却缺 `flow_started`、或 `flow_started` 的 `planned_nodes` 缺失/为空，均拒绝（退 `4` + "请换新工作区"），仍在一切写入之前、零写入；空账本（`last_seq == 0`）仍放行（`kernel/engine.py`）。
+- [x] **同源同目标多边被幂等合并**：`edge_taken` 幂等键由 `source->target` 升级为**单条边唯一**：`<run>-edge-<index>-<source>-><target>-<kind>`（`index` = 边在 `flow_ir.edges` 的声明序号，`kind ∈ {when, retry, timeout, auto}`），`payload` 增 `kind`；配套 `_edge_position_in_flow` 用对象同一性定位、找不到即 `ValueError`（fail-loud）（`kernel/engine_gates.py`）。
+- [x] **judge 异常后判节点进死胡同**：判定节点执行 judge 抛异常 → 边界捕获、**异常绝不穿透**，落**既有**终态 `node_failed`（`payload["reason"] = "<异常类型>: <消息>"`，上限 500 字符后加 `...(已截断)`），**未新增任何事件类型**；下游暂停由既有 `retry` 闸承接（**不** trip `verdict` 闸，避免同一次失败双重闸）（`kernel/engine_node_executors.py`）。
+- 新增测试：`test_adapter_cmd_line_safety.py`(14) + `test_adapter_shell_head_policy.py`(9) + `test_kernel_workspace_identity_strict.py`(10) + `test_kernel_edge_identity.py`(4) + `test_kernel_judge_failure_terminal.py`(6) + `test_validator_injection_policy.py`(6，接线) ＝ **+49 条**。
+- 被修改的既有测试（**均为纠正被缺陷钉住的前置条件，不是放宽断言**）：`test_kernel_engine_workspace_identity.py`（缺 `planned_nodes` 由"只比 run 名"改判"拒绝"）、`test_cli.py`（同类，改判退 `4`）、`test_kernel_engine_judge_fallback.py`（judge 异常由"trip verdict 闸"改判 `failed` + `reason` + 既有 retry 闸）、`test_windows_shim.py`（**仅 1 行格式断言**由裸 token 改带引号形态，`BatchShimInjectionSafetyTest` 等安全断言一字未动）。
+- 验收证据：独立跑 `python -m unittest discover -s tests` → **455 tests OK**；`-W always::ResourceWarning` 复跑 455 OK 且 `ResourceWarning` **归零**；全仓 `git ls-files --eol` 无 `w/crlf`；垃圾碎片扫描 0 命中。两条修复线各自做了"回退即变红"验证（适配侧 3 类红、内核侧缺陷 1 五处红 / 缺陷 2 一条红 / 缺陷 3 五处红）。
+
+#### 本轮行为变更（面向用户，升级前请读）
+
+- **旧账本跨版本续跑不兼容**：`edge_taken` 幂等键格式已变更（`<run>-edge-<source>-<target>` → `<run>-edge-<index>-<source>-><target>-<kind>`），同工作区升级内核后**已落账的边可能被重新激活** → **升级请换新工作区**。
+- **"无法校验身份"不再等于放行**：过去账本非空但缺 `flow_started`、或 `flow_started` 缺 `planned_nodes` 会被放行，现在退 `4`。
+- **shell 命令头不能再配 content 注入**：`cmd: 'cmd /c ...'` / `cmd: 'bash -c ...'` 这类配置现在编译报错（退出码 `3`）。
+- **含 `%` 的工作区路径 + `.cmd/.bat` agent 会被拒绝执行**：给出可执行建议（换个不含 `%` 的路径）；`.exe` 与 `powershell -File` 不受影响。
+- **judge 抛异常现在是"节点失败"而非"verdict 闸"**：落 `node_failed` 并按既有 `retry` 闸停住等人工；`flowrun status` 概览仍只显示状态词 `failed`，失败原因在账本 `node_failed.payload["reason"]`（CLI 概览暂不展示其正文，见 T020j）。
+
 ### M1 审计遗留（第二轮新发现，并入 M2 处理）
 
 | 条目 | 现象 | 位置 |
 |---|---|---|
 | out= 放行 NTFS ADS（✅ 第四轮已修） | `a.txt:stream` 形式未被拦（非路径逃逸，但可指同目录数据流） | `compiler/validator.py` |
-| cmd 垫片参数级注入面 | 模板参数本身含 `&`/`%`/`"` 时仍被 cmd.exe 重分词（暴露面与修复前同级，未新增） | `adapters/base.py` 启动计划 |
-| shell 命令头 content 模式理论绕过 | `cmd`/`powershell` 命令头走 content 模式的理论绕过面（默认多行 packet 不可触发） | `adapters/base.py` 注入模式判定 |
-| path 模式不中和 `%VAR%` | 仅当工作区路径含 `%…%` 时暴露 | `adapters/base.py` |
+| cmd 垫片参数级注入面（✅ 第五轮已修） | 模板参数本身含 `&`/`%`/`"` 时仍被 cmd.exe 重分词（暴露面与修复前同级，未新增） | `adapters/cmd_line_safety.py`（新增）、`adapters/base.py` 启动计划 |
+| shell 命令头 content 模式理论绕过（✅ 第五轮已修） | `cmd`/`powershell` 命令头走 content 模式的理论绕过面（默认多行 packet 不可触发） | `adapters/registry.py` 注入策略 + `compiler/validator.py` 报告 |
+| path 模式不中和 `%VAR%`（✅ 第五轮已修） | 仅当工作区路径含 `%…%` 时暴露 | `adapters/cmd_line_safety.py` |
 | 数值无上界（✅ 第四轮已修） | `timeout` 可溢出为 `inf`；`budget_tokens`/`retry` 无上限 | `compiler/limits.py`（新增）、`compiler/mermaid_edge_label.py`、`compiler/mermaid_parser.py` |
 | `timeout:` 边可指向 `human`（✅ 第四轮已修） | 现只拒 join/decision | `compiler/validator.py` |
 | 退出码 `2` 无生产者 | M1 无 `flow_halted`/`checkpoint` 写入方，`is_halted()` 恒 False、相关分支为死代码 | `cli.py`、`state/flow_state.py` |
 | CLI 单一 `except OSError` 误报（✅ 第四轮已修） | 写盘失败被报成"无法读取流程文件" | `cli.py` |
 | 勾选未到达的人审节点即判 done（✅ 第四轮已修） | 勾选尚未到达 `awaiting_human` 的人审节点会被立即判 done | `kernel/todo_projection.py` |
-| judge 异常后判节点进死胡同 | judge 异常兜底后判定节点无再审路径，resume 不可恢复 | `kernel/engine_node_executors.py`、`kernel/engine_gates.py` |
+| judge 异常后判节点进死胡同（✅ 第五轮已修） | judge 异常兜底后判定节点无再审路径，resume 不可恢复 | `kernel/engine_node_executors.py` |
 | usage 重复计数（✅ 第三轮已修） | usage 同时含数字叶子与 `total_tokens` 时重复计数 | `kernel/engine_evidence.py` |
 | 只读判定代理带写副作用（✅ 第三轮已修） | 只读判定代理构造 `EventLedger` 会截断账本尾行 | `kernel/hooks_assembly.py`、`state/ledger.py` |
 | 引擎账本句柄泄漏（✅ 第三轮已修） | `run_flow` 抛异常时内部账本句柄不关闭（测试可见 `ResourceWarning: unclosed file ledger.jsonl`） | `kernel/engine.py` |
-| 异常账本身份校验被跳过 | 账本非空但无 `flow_started` 时身份校验跳过、直接放行 | `kernel/engine.py` |
-| 同源同目标多边被幂等合并 | 多条无条件边被幂等键合并，丢失"哪条 when 边走"的审计事实 | `kernel/engine_gates.py` |
+| 异常账本身份校验被跳过（✅ 第五轮已修） | 账本非空但无 `flow_started` 时身份校验跳过、直接放行 | `kernel/engine.py` |
+| 同源同目标多边被幂等合并（✅ 第五轮已修） | 多条无条件边被幂等键合并，丢失"哪条 when 边走"的审计事实 | `kernel/engine_gates.py` |
 | 恢复增量盲区 | 同进程内"原地改写已确认前缀"不可被增量路径察觉（跨实例首次仍全量、可检出） | `state/ledger.py` |
 | `split_agent_command` 语义边界 | 空参数丢弃的语义将来若需传空参数会变；手写回退实现对病态引号序列与原生可能不一致 | `compiler/mermaid_parser.py` |
 | 文件超 ~400 行待拆分（✅ 已入结构拆分批次） | 真实行数超线的既有文件（口径已修正，见下）：`tests/` 5 个 + 2 个 `src` 文件；建议纯搬移拆分、行为零变化 | `tests/test_cli.py`(779)、`tests/test_mermaid_parser.py`(577)、`tests/test_compiler_validator.py`(531)、`tests/test_ledger.py`(499)、`tests/test_todo_projection.py`(463)、`src/flowrun/kernel/todo_projection.py`(457)、`src/flowrun/cli.py`(451)、`tests/test_kernel_engine_gates.py`(428)、`tests/test_kernel_judge.py`(424) |

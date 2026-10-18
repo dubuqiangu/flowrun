@@ -425,12 +425,13 @@ class CliTestCase(unittest.TestCase):
             (self.workspace / "ledger.jsonl").read_text(encoding="utf-8"),
         )
 
-    def test_resume_legacy_ledger_without_planned_nodes_checks_run_name_only(self) -> None:
-        """兼容边界：老账本 flow_started 无 planned_nodes → 只校验 run 名（防误伤）。
+    def test_resume_legacy_ledger_without_planned_nodes_is_rejected(self) -> None:
+        """缺陷 1（fail-closed）：老账本 flow_started 无 planned_nodes → 退 4。
 
-        节点集与"计划"不同也不得拦（无 planned_nodes 可比），故身份校验放行后由
-        非暂停态退 1 —— 而非身份不匹配的 4。
-        """
+        旧行为只校验 run 名（fail-open）放行后由非暂停态退 1；现改为身份不可校验
+        即拒绝：诊断须说明缺 planned_nodes 并建议换新工作区。
+
+        说明：这是**纠正前置条件**（拒绝而非跳过校验），不是放宽断言。"""
         self.workspace.mkdir(parents=True, exist_ok=True)
         ledger = EventLedger(self.workspace / "ledger.jsonl")
         try:
@@ -448,9 +449,9 @@ class CliTestCase(unittest.TestCase):
         exit_code, _stdout_text, stderr_text = self.invoke_cli(
             ["resume", "--flow", str(flow_path), "--workspace", str(self.workspace)]
         )
-        self.assertEqual(exit_code, 1, "身份校验放行后由非暂停态退 1")
-        self.assertIn("未处于暂停状态", stderr_text)
-        self.assertNotIn("不匹配", stderr_text)
+        self.assertEqual(exit_code, 4, "计划节点集缺失 = 身份不可校验 → 退 4")
+        self.assertIn("planned_nodes", stderr_text)
+        self.assertIn("换新工作区", stderr_text)
 
 
     # ---------------------------------------------------------------- status

@@ -8,7 +8,8 @@ ledger 事件——重放等价），轮内用局部 pending 集合防重复调�
   node_done / node_failed；
 - decision：probe → 入边来源证据包 → judge hook（出边 timeout_seconds 为其
   超时）→ verdict 落账 → tripped / 非法目标 → 闸；否则 edge_taken（FIX-B4：
-  判定 agent 不可用或 judge 抛异常一律落 verdict 闸转人审，不投递不穿透）；
+  判定 agent 不可用落 verdict 闸转人审，不投递不穿透；judge 调用抛异常则落
+  node_failed 终态并给出 reason，由既有失败处置策略接手——不新造事件类型）；
 - join：入边前驱全部 resolved（done 或 skipped——skip 视为已越过屏障，
   避免用户跳过某分支后 join 永久死锁）才 node_done（barrier）；
 - human：human_requested 落账后本轮即回（run_flow 挂起等待 todo 勾选）。
@@ -222,11 +223,17 @@ async def _execute_decision(
 ) -> None:
     """判定节点：probe → 证据包 → judge（出边定时器为超时）→ verdict → 边 / 闸。
 
-    FIX-B4 兜底：判定 agent 探活失败、或 judge 调用抛异常（如 agent 不在 PATH
-    时 spawn 抛 WinError 2）都落 ``gate_tripped(gate="verdict")`` 转人审——不投递、
-    不留悬挂 running、异常不穿透（穿透只会被 CLI 误报成"无法读取流程文件"）。
-    探活失败在落 agent_dispatched **之前**拦下；调用中异常时该节点残留的
-    running 由下一轮 ① 崩溃恢复（interrupted_by_restart）接手处置。
+    FIX-B4 兜底：判定 agent 探活失败落 ``gate_tripped(gate="verdict")`` 转人审
+    （不投递、不留悬挂 running、异常不穿透——穿透只会被 CLI 误报成"无法读取流程
+    文件"）。探活失败在落 agent_dispatched **之前**拦下。
+
+    judge 调用抛异常（如 agent 不在 PATH 时 spawn 抛 WinError 2）时，节点必须
+    落到**既有终态**：此处捕获后落 ``node_failed``（payload ``reason`` =
+    "异常类型: 消息"，截断），节点投影为 failed；其后由既有失败处置策略
+    （⑤ resolve_failed_node_policy）决定重入队 / retry 闸转人审。修复前这里
+    只落 verdict 闸、不落 node_failed，节点停留在非终态，靠下一轮的崩溃恢复
+    把它记成含糊的 "interrupted_by_restart"——判定失败的真实原因就此丢失，
+    resume 也推进不下去（死胡同）。
     """
     run_name = flow_ir.run_name
     node_id = decision_node.node_id
@@ -257,11 +264,10 @@ async def _execute_decision(
         )
         if inspect.isawaitable(verdict):
             verdict = await verdict
-    except Exception as judge_error:  # 判定失败一律转人审，绝不让异常穿透
-        _trip_gate(
-            ledger, run_name, node_id, GATE_VERDICT,
-            f"判定调用异常：{judge_error}",
-            "judge_decision 不得抛异常（spawn / IO 失败都应转为闸）",
+    except Exception as judge_error:  # 判定执行失败：落 node_failed 终态 + reason，异常绝不穿透
+        _append_node_failed(
+            ledger, run_name, node_id,
+            {"exit_code": None, "reason": describe_judge_failure(judge_error)},
         )
         return
     verdict_view = normalize_verdict(verdict)
@@ -290,17 +296,12 @@ async def _execute_decision(
             verdict_view.chosen_edge_target, sorted(valid_targets),
         )
         return
-    chosen_edge_when = next(
-        (
-            edge.when
-            for edge in outgoing_edges(flow_ir, node_id)
-            if edge.target_id == verdict_view.chosen_edge_target
-        ),
-        None,
+    chosen_edge = next(
+        edge
+        for edge in outgoing_edges(flow_ir, node_id)
+        if edge.target_id == verdict_view.chosen_edge_target
     )
-    append_edge_taken(
-        ledger, run_name, node_id, verdict_view.chosen_edge_target, chosen_edge_when
-    )
+    append_edge_taken(ledger, flow_ir, chosen_edge, chosen_edge.when)
 
 
 def _trip_gate(
@@ -373,3 +374,15 @@ def _append_node_failed(
         run_name,
         node_id,
     )
+
+
+MAX_JUDGE_FAILURE_REASON_LENGTH = 500
+"""node_failed.payload["reason"] 的长度上限（别把整段堆栈 / 长消息塞进账本）。"""
+
+
+def describe_judge_failure(judge_error: Exception) -> str:
+    """判定调用的失败原因（"异常类型: 消息"，超长则截断）——进 node_failed payload。"""
+    failure_reason = f"{type(judge_error).__name__}: {judge_error}"
+    if len(failure_reason) > MAX_JUDGE_FAILURE_REASON_LENGTH:
+        failure_reason = failure_reason[:MAX_JUDGE_FAILURE_REASON_LENGTH] + "...(已截断)"
+    return failure_reason

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from flowrun.adapters.cmd_line_safety import render_cmd_exe_arguments
 from flowrun.adapters.registry import (
     INJECTION_MODE_CONTENT,
     INJECTION_MODE_PATH,
@@ -114,8 +115,9 @@ class WindowsLaunchPlan:
     批处理垫片（.cmd/.bat）只能走后者。``cmd /c <shim> <args>`` 的 argv 形态在
     "垫片路径含空格 + 参数含空格"时会产生 4 个引号，触发 cmd.exe 的引号剥离
     启发式：垫片根本没跑，rc=1、stdout 为空（实测）。整串形态下 CPython 的 Popen
-    生成 ``cmd.exe /c "<list2cmdline 结果>"``，cmd 剥掉外层引号后正好是
-    ``"<shim>" <args>`` —— 这才是 cmd 认可的形态（实测三种空格组合全部 rc=0）。
+    生成 ``cmd.exe /c "<render_cmd_exe_arguments 结果>"``，cmd 剥掉外层引号后正好是
+    ``"<shim>" "<arg>"...``（每个 token 都已带引号）——这正是 cmd 认可的形态
+    （实测三种空格组合全部 rc=0）。
     """
 
     exec_arguments: tuple[str, ...] | None = None
@@ -155,8 +157,10 @@ def plan_windows_command_launch(command: list[str]) -> WindowsLaunchPlan:
         )
     resolved_suffix = Path(resolved_path).suffix.lower()
     if resolved_suffix in WINDOWS_BATCH_SHIM_SUFFIXES:
+        # 批处理垫片经 cmd.exe 执行：每个参数无条件加双引号（cmd 元字符失活），
+        # 含 %/"/\r/\n 的参数失败关闭（cmd 会展开 % 并重分词）。
         return WindowsLaunchPlan(
-            shell_command_line=subprocess.list2cmdline([resolved_path, *command[1:]])
+            shell_command_line=render_cmd_exe_arguments([resolved_path, *command[1:]])
         )
     if resolved_suffix in WINDOWS_POWERSHELL_SHIM_SUFFIXES:
         return WindowsLaunchPlan(exec_arguments=(

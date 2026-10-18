@@ -19,6 +19,12 @@
 "ready 的唯一来源是 ledger 事件"），idem 幂等键带 occurrence 段，
 同轮崩溃恢复后重复处置会因 FlowState 状态已变化而自然短路。
 
+出边幂等键（K3，按**单条边**唯一标识）：``run-edge-<index>-<source>-><target>-<kind>``。
+旧实现只按 ``source->target`` 生成键，同一对节点间的多条边（when/retry/timeout/auto
+并行）会共用一键而互相压制；新键以 ``index``（边在 FlowIR 中的位次）保证唯一。
+**跨版本不兼容**：旧账本里的 ``release-login-edge-A001-X001`` 形式键与新格式不等值，
+同工作区升级内核后已落账的边可能被重新激活——升级请换新工作区。
+
 闸的一次性语义（FIX-B2，docstring 冻结）：**每工作区每闸名至多触发一次**。
 ``gate_has_been_settled`` 是唯一判据：账内已出现同名 ``gate_tripped`` 即视为
 "了结"——无论其后是否跟过 ``flow_resumed``：
@@ -35,7 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from flowrun.ir.schema import FlowIR
+from flowrun.ir.schema import EdgeSpec, FlowIR
 from flowrun.state.flow_state import FlowState
 from flowrun.state.ledger import EventLedger, LedgerEntry
 
@@ -48,6 +54,10 @@ __all__ = [
     "GATE_VERDICT",
     "GATE_ILLEGAL_EDGE",
     "HOP_LIMIT_PER_NODE",
+    "EDGE_KIND_WHEN",
+    "EDGE_KIND_RETRY",
+    "EDGE_KIND_TIMEOUT",
+    "EDGE_KIND_AUTO",
     "GateFinding",
     "FailurePolicy",
     "FAILURE_ACTION_TIMEOUT_BRANCH",
@@ -62,6 +72,11 @@ __all__ = [
     "resolve_failed_node_policy",
     "count_node_events",
     "latest_event_payload",
+    "edge_kind",
+    "edge_idem_key",
+    "has_edge_been_taken",
+    "append_edge_taken",
+    "outgoing_activatable_edges",
 ]
 
 GATE_HOP = "hop"
@@ -75,6 +90,12 @@ HOP_LIMIT_PER_NODE = 4  # hop ≤ 4×节点数（design.md §5.3）
 FAILURE_ACTION_TIMEOUT_BRANCH = "timeout_branch"
 FAILURE_ACTION_REQUEUE = "requeue"
 FAILURE_ACTION_TRIP_GATE = "trip_gate"
+
+# 边类别（幂等键的排障段）：与 engine_graph 的边分类同序判定。
+EDGE_KIND_RETRY = "retry"      # retry > 0：源失败后重入队
+EDGE_KIND_TIMEOUT = "timeout"  # when=None 且带定时器：超时分支边
+EDGE_KIND_WHEN = "when"        # when 非空：判定谓词边 / join barrier 边
+EDGE_KIND_AUTO = "auto"        # 无条件边：源 done 即自动激活
 
 
 @dataclass
@@ -259,47 +280,87 @@ def latest_event_payload(
     return None
 
 
-def has_edge_been_taken(ledger: EventLedger, run_name: str, source_id: str, target_id: str) -> bool:
-    """(source,target) 边是否已激活过——⑤ 跨轮幂等的唯一判据。
+def edge_kind(edge: EdgeSpec) -> str:
+    """边的类别（幂等键的排障段）：retry > timeout > when > auto。"""
+    if edge.retry > 0:
+        return EDGE_KIND_RETRY
+    if edge.when is None and edge.timeout_seconds is not None:
+        return EDGE_KIND_TIMEOUT
+    if edge.when is not None:
+        return EDGE_KIND_WHEN
+    return EDGE_KIND_AUTO
 
-    边幂等键单射：同一对 source→target 的无条件/barrier 边只激活一次；
-    判定节点选边与 ⑤ 共用该键，因此"判定选中 + 出边激活"不会双落。
+
+def edge_idem_key(flow_ir: FlowIR, edge: EdgeSpec) -> str:
+    """单条边的幂等键——**唯一标识 FlowIR 里的一条边**（可读、可排障）。
+
+    FlowIR 的边没有 id 字段，故用它在 ``flow_ir.edges`` 里的**声明序号**做稳定
+    身份（按对象同一性定位，故端到端完全重复的两条边也各得其所）；序号在语义上
+    是稳的——换图会被工作区身份校验拦下（verify_workspace_matches_flow）。
+    再带上 source→target 与类别，使键自身就能读出是哪条边。格式：
+
+    ``<run>-edge-<index>-<source>-><target>-<kind>``
+
+    修复点：旧键 ``<run>-edge-<source>-<target>`` 不含边身份，同源同目标的多条
+    边（如一条 when:all + 一条 timeout）会撞成同一键，第二条边被当成"重复投递"
+    丢弃，账本少记一条边激活（审计失真）。**键格式变更 → 旧账本跨版本续跑时边
+    幂等键不兼容**（旧键的 edge_taken 不再被认作"这条边已走过"）。
     """
-    edge_idem_key = f"{run_name}-edge-{source_id}-{target_id}"
-    return any(entry.idem == edge_idem_key for entry in ledger.entries())
+    edge_index = _edge_position_in_flow(flow_ir, edge)
+    return (
+        f"{flow_ir.run_name}-edge-{edge_index}-"
+        f"{edge.source_id}->{edge.target_id}-{edge_kind(edge)}"
+    )
+
+
+def _edge_position_in_flow(flow_ir: FlowIR, edge: EdgeSpec) -> int:
+    """边在 ``flow_ir.edges`` 里的声明序号（按对象同一性，重复边也各有其位）。"""
+    for edge_index, candidate in enumerate(flow_ir.edges):
+        if candidate is edge:
+            return edge_index
+    raise ValueError("边不在该 FlowIR 的 edges 声明中，无法生成幂等键")
+
+
+def has_edge_been_taken(ledger: EventLedger, flow_ir: FlowIR, edge: EdgeSpec) -> bool:
+    """该条边是否已激活过——⑤ 跨轮幂等的唯一判据（幂等键按边身份单射）。
+
+    同源同目标的多条边各自独立：一条已走过不影响另一条被激活。
+    """
+    return any(entry.idem == edge_idem_key(flow_ir, edge) for entry in ledger.entries())
 
 
 def append_edge_taken(
     ledger: EventLedger,
-    run_name: str,
-    source_id: str,
-    target_id: str,
+    flow_ir: FlowIR,
+    edge: EdgeSpec,
     when_text: str | None = None,
 ) -> LedgerEntry:
     """落一条 edge_taken 事件（source→done 审计、target→ready 投影）。"""
-    payload = {"source": source_id, "target": target_id}
+    payload = {
+        "source": edge.source_id,
+        "target": edge.target_id,
+        "kind": edge_kind(edge),
+    }
     if when_text is not None:
         payload["when"] = when_text
     return ledger.append(
         "edge_taken",
         payload,
-        f"{run_name}-edge-{source_id}-{target_id}",
-        run_name,
-        source_id,
+        edge_idem_key(flow_ir, edge),
+        flow_ir.run_name,
+        edge.source_id,
     )
 
 
-def outgoing_unconditional_targets(flow_ir: FlowIR, node_id: str) -> list[tuple[str, str | None]]:
-    """done 节点待激活的出边 (target_id, when) 列表：无条件边 + barrier 边。
+def outgoing_activatable_edges(flow_ir: FlowIR, node_id: str) -> list[EdgeSpec]:
+    """done 节点待激活的出边：无条件边 + barrier 边（按声明顺序，含重复边）。
 
     barrier 边（when="all"）在源 done 时即可激活——等齐语义由 join 执行器
     在其 node_done 前把关，这里的激活只负责"让 join 变 ready"。
     超时分支边不在此列：它只在源节点超时失败时走（见 resolve_failed_node_policy）。
     """
-    activated: list[tuple[str, str | None]] = []
-    for edge in outgoing_edges(flow_ir, node_id):
-        if edge.when is None and edge.timeout_seconds is None:
-            activated.append((edge.target_id, None))
-        elif edge.when == "all":
-            activated.append((edge.target_id, edge.when))
-    return activated
+    return [
+        edge
+        for edge in outgoing_edges(flow_ir, node_id)
+        if (edge.when is None and edge.timeout_seconds is None) or edge.when == "all"
+    ]

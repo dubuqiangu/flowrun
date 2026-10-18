@@ -1,5 +1,6 @@
-"""域D2 · 判定路径兜底测试（FIX-B4）：判定 agent 探活失败 / judge 调用抛异常时，
-落 gate_tripped(gate="verdict") 转人审——不投递、不留悬挂 running、异常不穿透。
+"""域D2 · 判定路径兜底测试（FIX-B4）：判定 agent 探活失败落 gate_tripped(gate="verdict")
+转人审；judge 调用抛异常落 node_failed 终态（原因进 payload["reason"]），由既有失败
+处置策略落闸——两种情况都不投递、异常不穿透。
 
 直跑：python -m unittest discover -s tests
 """
@@ -90,20 +91,33 @@ class JudgeFallbackTestCase(unittest.TestCase):
 
     # ---------------------------------------------------------------- 异常兜底
 
-    def test_judge_exception_trips_verdict_gate_without_propagating(self) -> None:
-        """FIX-B4 复现：judge 调用抛异常 → 不穿透到调用方，落 verdict 闸暂停转人审。"""
+    def test_judge_exception_fails_decision_node_without_propagating(self) -> None:
+        """缺陷 3：judge 调用抛异常 → 不穿透到调用方；判定节点落到**既有终态** failed，
+        失败原因（"异常类型: 消息"）进 node_failed payload["reason"]，再由既有失败处置
+        策略落闸转人审。
+
+        旧行为只落 verdict 闸、不落 node_failed：节点停留在非终态，靠下一轮崩溃恢复
+        记成含糊的 interrupted_by_restart，判定失败的真实原因丢失且推进不下去。
+
+        说明：这是**纠正前置条件**——旧断言钉住的正是该缺陷行为（判定失败不留失败
+        事件），改为钉住"节点必须到既有终态 + 原因留痕"。"""
         self.stubs = _RaisingJudgeStubs()
         flow_ir = self.make_decision_flow()
 
         final_state = self.run_flow_once(flow_ir)
 
-        self.assertTrue(final_state.is_paused())
-        self.assertIn("verdict", final_state.tripped_gates())
+        self.assertTrue(final_state.is_paused(), "判定失败仍须转人审挂起")
+        self.assertEqual(
+            final_state.node_status("D001"), "failed", "判定节点必须落到既有终态 failed"
+        )
         ledger = self.reopened_ledger()
-        gate_events = support.events_of_type(ledger, "gate_tripped", "D001")
-        self.assertEqual(gate_events[-1].payload["gate"], "verdict")
-        self.assertIn("可执行文件不存在", str(gate_events[-1].payload["actual"]))
+        failure_events = support.events_of_type(ledger, "node_failed", "D001")
+        self.assertEqual(len(failure_events), 1)
+        failure_reason = failure_events[0].payload["reason"]
+        self.assertIn("FileNotFoundError", failure_reason)
+        self.assertIn("可执行文件不存在", failure_reason)
         self.assertEqual(support.events_of_type(ledger, "verdict", "D001"), [])
+        self.assertIn("retry", final_state.tripped_gates())
         self.assertEqual(final_state.node_status("T002"), "planned")
 
     # ---------------------------------------------------------------- 正常路径不受影响

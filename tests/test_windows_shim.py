@@ -57,8 +57,10 @@ class PlanWindowsCommandLaunchTest(unittest.TestCase):
         self.assertIsNone(launch_plan.exec_arguments)
         # 盘上大小写可能不同（which/字面探测保留实际文件名），比较不区分大小写
         self.assertIn("fake_agent.cmd", launch_plan.shell_command_line.casefold())
+        # 参数形态断言（非安全断言）：.cmd 分支对每个参数无条件加双引号，
+        # 故尾部参数序列仍为 -p / --packet / x.md，只是由裸 token 变为带引号形态。
         self.assertTrue(
-            launch_plan.shell_command_line.endswith("-p --packet x.md"),
+            launch_plan.shell_command_line.endswith('"-p" "--packet" "x.md"'),
             launch_plan.shell_command_line,
         )
 

@@ -23,7 +23,7 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # 仅供类型标注，运行期不导入（base.py 依赖本模块，避免环）
@@ -56,6 +56,18 @@ WINDOWS_COMMAND_SUFFIX_CANDIDATES = (".exe", ".cmd", ".bat", ".ps1")
 WINDOWS_BATCH_SHIM_SUFFIXES = (".cmd", ".bat")
 WINDOWS_POWERSHELL_SHIM_SUFFIXES = (".ps1",)
 WINDOWS_SHIM_SUFFIXES = WINDOWS_BATCH_SHIM_SUFFIXES + WINDOWS_POWERSHELL_SHIM_SUFFIXES
+
+# 已知 shell 命令头（一律 casefold）：命令头**本身就是** shell 解释器。此时走
+# content 模式 = packet 正文作为位置参数进入 argv，会被该 shell 重新分词
+# （重定向/管道/命令分隔符），等于把 packet 当代码执行。默认多行 packet 不可
+# 触发，但仍是理论绕过面，故在编译期（见 validate_agent_injection_policy）拒绝。
+KNOWN_SHELL_COMMAND_HEADS = frozenset({
+    "cmd", "cmd.exe",
+    "powershell", "powershell.exe",
+    "pwsh", "pwsh.exe",
+    "sh", "sh.exe",
+    "bash", "bash.exe",
+})
 
 # 命令头（command[0]）→ 适配器类。内置项由 claude_code / opencode_cli
 # 模块级 @register_adapter 装饰器在导入时填充。键一律 casefold()：
@@ -209,3 +221,79 @@ def probe_available(agent_registry: dict[str, AgentCommandSpec]) -> dict[str, bo
             and resolve_command_path(agent_spec.command[0]) is not None
         )
     return availability
+
+
+class ShellCommandHeadContentInjectionError(ValueError):
+    """命令头是已知 shell 且注入模式为 content：正文进 argv 会被重分词，拒绝。"""
+
+
+def is_known_shell_command_head(command_head: str) -> bool:
+    """命令头是否为本机已知的 shell 解释器（按文件名判定，不区分大小写/目录）。"""
+    if not command_head:
+        return False
+    return PureWindowsPath(command_head).name.casefold() in KNOWN_SHELL_COMMAND_HEADS
+
+
+def require_safe_injection_for_command_head(
+    command_head: str,
+    injection_mode: str,
+    *,
+    agent_name: str | None = None,
+) -> None:
+    """已知 shell 命令头 + content 注入模式 → 拒绝（清晰诊断，不自动改 path）。
+
+    调用点应位于**编译期**（命令模板定型时）而非运行时：运行时才发现意味着
+    正文已经躺在即将交给 shell 的命令行里。**不**自动改成 path 模式——把
+    packet 路径喂给一个 shell 会让它试图执行该路径，比直接拒绝更危险。
+    """
+    if injection_mode != INJECTION_MODE_CONTENT:
+        return
+    if not is_known_shell_command_head(command_head):
+        return
+    agent_clause = f"agent '{agent_name}' 的" if agent_name else ""
+    raise ShellCommandHeadContentInjectionError(
+        f"{agent_clause}命令头 '{command_head}' 是 shell 解释器，而 packet 走 "
+        "content 注入模式：正文会作为位置参数进入 argv，被该 shell 重新分词"
+        "（重定向/管道/命令分隔符），等于把 packet 当代码执行。"
+        " 请改用路径注入（模板里写 __FLOW_PACKET_PATH__，由 agent 自己读文件），"
+        "或换一个非 shell 的命令头。这里编译期拒绝而非自动改 path 模式："
+        "把 packet 路径喂给 shell 会试图执行它，比拒绝更危险。"
+    )
+
+
+def require_safe_injection_for_declared_agent(
+    agent_name: str,
+    agent_spec: AgentCommandSpec,
+) -> None:
+    """单个 agent 的注入安全校验（编译期入口，逐 agent 一个诊断）。
+
+    **先做廉价的纯名字预筛**：只有命令头确为已知 shell 时才解析注入模式。
+    理由是成本而不是正确性——``resolve_injection_mode`` 会做一次有界 PATH 扫描
+    （实测约 51ms/次未命中、约 26ms/次命中），而正常 agent（claude / opencode
+    等非 shell 命令头）在任何注入模式下都不会被 shell 重分词，没必要为它们
+    在编译期付这个代价。语义与 ``validate_agent_injection_policy`` 完全一致
+    （后者即逐个 agent 调用本函数）。
+    """
+    if not agent_spec.command:
+        return
+    if not is_known_shell_command_head(agent_spec.command[0]):
+        return
+    from flowrun.adapters.base import resolve_injection_mode  # 惰性导入：避免环
+
+    require_safe_injection_for_command_head(
+        agent_spec.command[0],
+        resolve_injection_mode(agent_spec.command),
+        agent_name=agent_name,
+    )
+
+
+def validate_agent_injection_policy(
+    agent_registry: dict[str, AgentCommandSpec],
+) -> None:
+    """编译期校验：逐个 agent 求注入模式，命中"已知 shell 命令头 + content"即拒绝。
+
+    与 ``probe_available`` 一样只读 registry；逐 agent 的逻辑与预筛见
+    ``require_safe_injection_for_declared_agent``。
+    """
+    for agent_name, agent_spec in agent_registry.items():
+        require_safe_injection_for_declared_agent(agent_name, agent_spec)

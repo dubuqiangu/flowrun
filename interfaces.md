@@ -31,7 +31,8 @@ flowrun/
 │   │   └── snapshots.py         # 域B：快照与恢复
 │   ├── adapters/
 │   │   ├── base.py              # 域C：适配器接口 + 双信号退出监视器
-│   │   ├── registry.py          # 域C：声明式注册 + which 探测 + 注入模式
+│   │   ├── registry.py          # 域C：声明式注册 + which 探测 + 注入模式 + 注入策略校验
+│   │   ├── cmd_line_safety.py   # 域C：cmd.exe 命令行参数渲染（不可安全表达即拒绝）
 │   │   ├── claude_code.py       # 域C
 │   │   └── opencode_cli.py      # 域C
 │   ├── kernel/                  # 域D：engine / engine_gates / engine_node_executors /
@@ -157,8 +158,10 @@ def probe_available(agent_registry: dict[str, AgentCommandSpec]) -> dict[str, bo
 
 两种垫片的启动方式不同：
 
-- `.cmd` / `.bat`：正文进文件，启动时把**整条命令行**（由 `subprocess.list2cmdline` 生成）交给 `create_subprocess_shell`，以规避"垫片路径与参数都含空格时 cmd 引号剥离导致垫片根本不执行"。
+- `.cmd` / `.bat`：正文进文件，启动时把**整条命令行**（由 `adapters/cmd_line_safety.py` 的 `render_cmd_exe_arguments` 渲染）交给 `create_subprocess_shell`，以规避"垫片路径与参数都含空格时 cmd 引号剥离导致垫片根本不执行"。渲染规则（M2 加固）：**每个参数无条件加双引号**（`&` / `|` / `^` / `<` / `>` / 空白 一律失活——**不依赖"元字符枚举是否完整"**）；参数含 `%` / `"` / CR / LF 时**拒绝执行**并抛 `CmdExeUnsafeArgumentError`（`%` 在 cmd.exe 里即使位于双引号内也会展开，`%%` 也非命令行层面的可靠转义，故只能失败关闭；`"` 在 Windows 路径中本就非法）。**边界**：直接经 `CreateProcess` 启动的进程（`.exe`、`powershell -File`）不做此限制——那里 `%` 是字面量。
 - `.ps1`：与 `.cmd/.bat` 一样走 path 模式，启动方式为 `powershell -NoProfile -ExecutionPolicy Bypass -File <shim>`。
+
+**注入策略校验（M2 加固，**编译期**）**：注入模式是**派生**的（垫片 → path，其余 → content），前端没有开关可配。若命令头本身是已知 shell 解释器（`cmd` / `cmd.exe` / `powershell(.exe)` / `pwsh(.exe)` / `sh(.exe)` / `bash(.exe)`；按**文件名**判定，忽略目录与大小写），content 注入会把 packet 正文作为位置参数交给该 shell 重新分词 → **编译期即拒绝**：`ShellCommandHeadContentInjectionError`，由 `adapters/registry.py` 的 `require_safe_injection_for_declared_agent`（或整表入口 `validate_agent_injection_policy`）判定，`compiler/validator.py` 逐 agent 收集为 `ValidationError`（退出码 3，拒绝发生在**任何写入之前**）。**不自动改 path 模式**——把 packet 路径喂给 shell 会试图执行它，比拒绝更危险。**性能口径**：`resolve_injection_mode` 内含一次有界 PATH 扫描（实测约 51ms/次未命中），故先做**纯名字预筛**（`is_known_shell_command_head`，零探测），只有确为 shell 命令头才解析注入模式。
 
 命令头在 win32 上不可解析时抛 `CommandHeadUnresolvableError`（**继承 `FileNotFoundError`**）并给可读提示，不再让 `WinError 2` 穿透。
 
@@ -173,6 +176,9 @@ claude/opencode 两个适配器 + registry 的声明式注册，具体命令按 
 - engine/judge/todo_projection/stub_generator 只 import `ir.schema`、`state.ledger`、`state.snapshots`、`adapters.base`、`adapters.registry`，**不得**绕过接口直接读上游内部结构。
 - 判定 LLM 调用 = 通过适配器投递判定 packet（`__FLOW_PACKET__` 注入 JSON Schema 约束的判定提示），M1 不接任何 LLM SDK。
 - packet.md 格式按 design.md §4.3。
+- **工作区身份（fail-closed，M2 加固）**：`verify_workspace_matches_flow(flow_ir, ledger) -> None` 在**一切写入之前、零写入**执行，`run` 与 `resume` 同一套。空账本（`last_seq == 0`）= 新工作区，放行；其余一律以 `flow_started` 为身份真相源，其 `planned_nodes` 与当前图节点集**严格集合相等**（多一个/少一个都拒）。**"无法校验"不再等于放行**：账本非空却缺 `flow_started`、或 `flow_started` 的 `planned_nodes` 缺失/为空，均抛 `FlowWorkspaceMismatchError` → 退出码 `4` + "请换新工作区"。
+- **边身份与幂等键（M2 加固）**：`edge_taken` 的幂等键按**单条边**唯一——`<run>-edge-<index>-<source>-><target>-<kind>`（`index` 为边在 `flow_ir.edges` 中的声明序号，`kind ∈ {when, retry, timeout, auto}`），`payload` 含 `kind`；同源同目标的多条边因此各自落账，不再互相压制。**跨版本不兼容**：旧账本 `<run>-edge-<source>-<target>` 形式键与新格式不等值，升级请换新工作区。相关签名：`has_edge_been_taken(ledger, flow_ir, edge[, when_text])` / `append_edge_taken(ledger, flow_ir, edge[, when_text])`。
+- **判定异常终态（M2 加固）**：判定节点执行 judge 时抛异常 → 在边界捕获、异常**绝不穿透**，落**既有**终态事件 `node_failed`（沿用既有状态 `failed`，不新增事件类型），`payload["reason"] = "<异常类型>: <消息>"`（上限 500 字符后加 `...(已截断)`）；下游暂停由既有 `retry` 闸失败策略承接（**不**trip `verdict` 闸，避免同一次失败双重闸）。
 
 ## 6. 冒烟口径（T013）
 

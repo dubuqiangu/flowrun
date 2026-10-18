@@ -19,6 +19,8 @@ Implements tasks.md T003:
   'decision' node, never combined with 'retry: N'
 - the flow must have at least one entry node (a node without incoming edges)
 - every edge endpoint (including timeout edges) must reference a defined node
+- no agent may pair a known shell command head with content injection (that shell
+  would re-tokenize the packet body carried in argv)
 """
 
 from __future__ import annotations
@@ -26,6 +28,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 
+from flowrun.adapters.registry import (
+    ShellCommandHeadContentInjectionError,
+    require_safe_injection_for_declared_agent,
+)
 from flowrun.compiler.mermaid_parser import (
     FlowchartDocument,
     ParsedEdge,
@@ -100,6 +106,15 @@ def _analyze_document(document: FlowchartDocument) -> tuple[FlowIR | None, list[
             metadata_line,
             f"default agent '{document.default_agent}' is not registered in frontmatter 'agents'",
         )
+    # 注入策略（判定在域C 的 registry，报告在域A 的校验器）：命令头是已知 shell 而
+    # packet 走 content 注入 = 正文本会作为位置参数进入 argv 被该 shell 重分词。
+    # 逐 agent 调用以便一次给出全部违规；非 shell 命令头由纯名字预筛短路，不做
+    # PATH 探测（见 registry.require_safe_injection_for_declared_agent）。
+    for agent_name, agent_spec in document.agent_registry.items():
+        try:
+            require_safe_injection_for_declared_agent(agent_name, agent_spec)
+        except ShellCommandHeadContentInjectionError as injection_error:
+            report(metadata_line, str(injection_error))
 
     incoming_edges: dict[str, list[ParsedEdge]] = {node_id: [] for node_id in document.nodes}
     outgoing_edges: dict[str, list[ParsedEdge]] = {node_id: [] for node_id in document.nodes}
