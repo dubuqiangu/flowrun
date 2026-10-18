@@ -2,7 +2,9 @@
 tripped、join 等齐、human 暂停与 todo 续跑、fan-in 不重复投递、重放一致性。
 
 直跑：python -m unittest discover -s tests
-闸与重试/崩溃恢复类测试见 test_kernel_engine_gates.py。
+闸与重试/超时分支见 test_kernel_engine_gates.py，恢复与失败路由见
+test_kernel_engine_gates_recovery.py，终态守卫见
+test_kernel_engine_terminal_state_guards.py。
 """
 
 import asyncio
@@ -24,7 +26,7 @@ from flowrun.ir.schema import (  # noqa: E402
     NODE_KIND_JOIN,
 )
 from flowrun.kernel.engine import run_flow  # noqa: E402
-from flowrun.kernel.todo_projection import apply_user_marks, write_todo  # noqa: E402
+from flowrun.kernel.todo_projection import apply_user_marks  # noqa: E402
 from flowrun.state.ledger import EventLedger  # noqa: E402
 
 

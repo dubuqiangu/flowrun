@@ -214,7 +214,16 @@
 
 **契约保持**：拆分后所有既有模块级公共名在**原路径**仍可导入（`todo_projection` / `hooks_assembly` / `engine_node_executors` 保留再导出；三个文件的 `__all__` **逐字未改**）。私有助手在提取时改为公共名（`_execute_decision` → `execute_decision`、`_trip_gate` → `trip_decision_gate`、`_append_node_failed` → `append_node_failed`、`_open_workspace_state` / `_workspace_ledger_path` / `_workspace_is_initialized` / `_append_human_resolution` / `_print_state_summary` 去掉下划线），属提取的一部分、**非公共 API 变更**。
 
-**验收证据**：`python -m unittest discover -s tests` → **455 tests OK**（多次复跑一致）；`-W always::ResourceWarning` → 455 OK 且 `ResourceWarning` **归零**；用 `TestLoader.discover` 对比拆分前后**叶子测试方法名多重集 `identical: True`**（无增 / 无删 / 无改名；`module.Class` 段随文件归属变化是拆分的必然，与既有 `test_ledger_readonly_view.py` 等先例一致）；全仓 108 个文件 **0 个 BOM、0 个 CRLF**；行数扫描仅余 `tests/test_kernel_engine_gates.py`(428)、`tests/test_kernel_judge.py`(424) 两个待拆（下一轮）。纯搬移核验：改文件 `git diff --stat` 为 **75 增 / 749 删**（删多于增 = 搬出特征），AST 级字符串字面量与 def/class/赋值名字多重集比对无删减。
+**验收证据**：`python -m unittest discover -s tests` → **455 tests OK**（多次复跑一致）；`-W always::ResourceWarning` → 455 OK 且 `ResourceWarning` **归零**；用 `TestLoader.discover` 对比拆分前后**叶子测试方法名多重集 `identical: True`**（无增 / 无删 / 无改名；`module.Class` 段随文件归属变化是拆分的必然，与既有 `test_ledger_readonly_view.py` 等先例一致）；全仓 108 个文件 **0 个 BOM、0 个 CRLF**；行数扫描当时余 `tests/test_kernel_engine_gates.py`(428)、`tests/test_kernel_judge.py`(424) 两个待拆 → 见下方收官记录。纯搬移核验：改文件 `git diff --stat` 为 **75 增 / 749 删**（删多于增 = 搬出特征），AST 级字符串字面量与 def/class/赋值名字多重集比对无删减。
+
+**`tests/` 收官（第六轮下半，同日）**
+
+| 原文件 | 前 → 拆为（真实行数，括号内为测试条数） |
+|---|---|
+| `test_kernel_engine_gates.py` | 428 → 157(5) + `test_kernel_engine_gates_recovery.py`(104, 2) + `test_kernel_engine_terminal_state_guards.py`(205, 4) |
+| `test_kernel_judge.py` | 424 → 184(14) + `test_kernel_judge_verdict_extraction.py`(113, 15) |
+
+支持模块（同样不被收集）：`kernel_engine_gates_support.py`(41)、`kernel_judge_support.py`(174)。收官后**全仓 113 个文件无一个超 400 行**。纯搬移证据：AST **方法级**比对 `54 → 54`，`missing / extra / changed` 全空（方法正文逐字未动）；叶子测试方法名多重集 `identical: True`；455 tests OK 且 `ResourceWarning` 归零。另清掉一处**既存**未用导入（`tests/test_kernel_engine.py` 的 `write_todo`，自 HEAD 起即未使用，非本次拆分引入）。
 
 ### M1 审计遗留（第二轮新发现，并入 M2 处理）
 
@@ -237,7 +246,7 @@
 | 同源同目标多边被幂等合并（✅ 第五轮已修） | 多条无条件边被幂等键合并，丢失"哪条 when 边走"的审计事实 | `kernel/engine_gates.py` |
 | 恢复增量盲区 | 同进程内"原地改写已确认前缀"不可被增量路径察觉（跨实例首次仍全量、可检出） | `state/ledger.py` |
 | `split_agent_command` 语义边界 | 空参数丢弃的语义将来若需传空参数会变；手写回退实现对病态引号序列与原生可能不一致 | `compiler/mermaid_parser.py` |
-| 文件超 ~400 行（✅ 第六轮已拆分，余 2 个） | 真实行数超线的既有文件（口径已修正，见下）。第六轮已把 `src/` 4 个 + `tests/` 5 个**纯搬移**拆到 ≤400；**尚余** `tests/test_kernel_engine_gates.py`(428)、`tests/test_kernel_judge.py`(424) | 见「M1 结构拆分批次（第六轮）」 |
+| 文件超 ~400 行（✅ 第六轮已全部拆分） | 真实行数超线的既有文件（口径已修正，见下）。第六轮已把 `src/` 4 个 + `tests/` 7 个**纯搬移**拆到 ≤400（含下半收官），**全仓 113 个文件已无超线文件** | 见「M1 结构拆分批次（第六轮）」 |
 
 > **行数口径修正（2026-10-18）**：此前用 PowerShell `Measure-Object -Line` 统计，该 cmdlet **跳过空行**，全仓行数被低估约 15%（例：`cli.py` 记 360、实为 451）。改用字节级 `splitlines()` 重测后得左侧真实清单。第四轮起，新代码一律落到新模块/新测试文件（`compiler/limits.py`、`test_compiler_limits.py`、`test_cli_io_errors.py`、`test_todo_projection_human_guard.py`），未再给超线文件加厚。
 
