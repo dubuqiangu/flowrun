@@ -10,6 +10,9 @@ ledger 事件现算（重放等价），本进程内的 DispatchResult 只补充
 orchestrator 裁决后可统一。verdict 归一化同时接受数据类（按属性读
 tripped/chosen_edge_target/confidence/evidence）与 dict（按键读），测试
 stub 与域D1 实现都能直接喂给引擎。
+
+T020a：判定投递事实（``dispatch_facts``）同样按"数据类属性或 dict 键"归一，
+由 decision_executor 落成判定节点的 ``agent_exited``（payload 带 ``tokens``）。
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from .engine_graph import incoming_edges
 __all__ = [
     "UpstreamNodeEvidence",
     "EvidencePack",
+    "JudgeDispatchFacts",
     "VerdictView",
     "assemble_evidence_pack",
     "normalize_verdict",
@@ -55,6 +59,22 @@ class EvidencePack:
     upstream_evidence: list[UpstreamNodeEvidence] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class JudgeDispatchFacts:
+    """判定 agent 投递的审计事实（域D1 ``judge.JudgeDispatchFacts`` 的**结构等价**读法）。
+
+    tasks.md T020a：判定消耗必须与 task 路径同口径入账——``tokens`` 进判定节点
+    ``agent_exited.payload``，FlowState 据此累加 ``token_spent()``，budget 闸才
+    看得见判定成本。本域不 import 域D1 文件（并行开发纪律），故此处独立定义
+    同结构的数据类，由 ``normalize_verdict`` 做一层读取适配。
+    """
+
+    tokens: int = 0
+    exit_code: int | None = None
+    timed_out: bool = False
+    semantic_done: bool = False
+
+
 @dataclass
 class VerdictView:
     """归一化后的判定结论（域D1 JudgeVerdict 或 dict 的统一读法）。"""
@@ -63,6 +83,7 @@ class VerdictView:
     chosen_edge_target: str | None
     confidence: float | None
     evidence: list
+    dispatch_facts: JudgeDispatchFacts | None = None  # 判定投递事实（T020a）；None=未回传
 
 
 def assemble_evidence_pack(
@@ -115,7 +136,9 @@ def normalize_verdict(verdict: object) -> VerdictView:
     """把域D1 的 JudgeVerdict 数据类或 dict 归一成引擎统一读取的 VerdictView。
 
     缺字段按保守值处理：tripped 缺省 False，chosen_edge_target 缺省 None
-    （None 不在任何出边集合内 → 必然落 illegal_edge 闸，宁停不越权）。
+    （None 不在任何出边集合内 → 必然落 illegal_edge 闸，宁停不越权）；
+    dispatch_facts 缺省 None（判定 hook 未回传投递事实 → 不落 agent_exited，
+    存量判定路径的账本形状零变化）。
     """
     if isinstance(verdict, dict):
         return VerdictView(
@@ -123,12 +146,41 @@ def normalize_verdict(verdict: object) -> VerdictView:
             chosen_edge_target=verdict.get("chosen_edge_target"),
             confidence=verdict.get("confidence"),
             evidence=list(verdict.get("evidence") or []),
+            dispatch_facts=_dispatch_facts_from(verdict.get("dispatch_facts")),
         )
     return VerdictView(
         tripped=bool(getattr(verdict, "tripped", False)),
         chosen_edge_target=getattr(verdict, "chosen_edge_target", None),
         confidence=getattr(verdict, "confidence", None),
         evidence=list(getattr(verdict, "evidence", None) or []),
+        dispatch_facts=_dispatch_facts_from(getattr(verdict, "dispatch_facts", None)),
+    )
+
+
+def _dispatch_facts_from(dispatch_facts_source: object) -> JudgeDispatchFacts | None:
+    """读判定投递事实（数据类属性或 dict 键），未回传返回 None。
+
+    ``tokens`` 经 :func:`_as_token_count` 归一：bool / 非数值 / NaN 一律按 0
+    （不可审计的数字不进账本，也不进 budget 闸）。
+    """
+    if dispatch_facts_source is None:
+        return None
+    if isinstance(dispatch_facts_source, dict):
+        raw_tokens = dispatch_facts_source.get("tokens")
+        exit_code = dispatch_facts_source.get("exit_code")
+        timed_out = dispatch_facts_source.get("timed_out")
+        semantic_done = dispatch_facts_source.get("semantic_done")
+    else:
+        raw_tokens = getattr(dispatch_facts_source, "tokens", None)
+        exit_code = getattr(dispatch_facts_source, "exit_code", None)
+        timed_out = getattr(dispatch_facts_source, "timed_out", None)
+        semantic_done = getattr(dispatch_facts_source, "semantic_done", None)
+    token_count = _as_token_count(raw_tokens)
+    return JudgeDispatchFacts(
+        tokens=0 if token_count is None else token_count,
+        exit_code=exit_code,
+        timed_out=bool(timed_out),
+        semantic_done=bool(semantic_done),
     )
 
 

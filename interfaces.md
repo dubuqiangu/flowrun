@@ -22,7 +22,8 @@ flowrun/
 │   │   ├── mermaid_syntax.py    # 域A：单行 tokenize + 节点/边 token 解析
 │   │   ├── mermaid_edge_label.py # 域A：边标签 when / retry / timeout 解析
 │   │   ├── mermaid_errors.py    # 域A：MermaidParseError（带 Mermaid 行号）
-│   │   ├── mermaid_parser.py    # 域A：flow.mmd → 原始解析树
+│   │   ├── mermaid_parser.py    # 域A：flow.mmd → 原始解析树（再导出 split_agent_command）
+│   │   ├── agent_command_splitter.py # 域A：win32 命令分词（CommandLineToArgvW，fail-loud）
 │   │   ├── limits.py            # 域A：编译期数值上限（timeout / budget_tokens / retry）
 │   │   └── validator.py         # 域A：解析树 → FlowIR + 校验错误(带行号)
 │   ├── state/
@@ -167,7 +168,7 @@ def probe_available(agent_registry: dict[str, AgentCommandSpec]) -> dict[str, bo
 
 命令头在 win32 上不可解析时抛 `CommandHeadUnresolvableError`（**继承 `FileNotFoundError`**）并给可读提示，不再让 `WinError 2` 穿透。
 
-**`split_agent_command`（win32 命令分词）**：采用 `CommandLineToArgvW` 语义（优先 ctypes 原生调用，不可用时回退到按 MS 规则的等价手写实现）——引号内的 `&`、`;`、`|`、`%` 是**字面量**，空词丢弃，未闭合引号仍报错；**非 win32 分支行为不变**（仍走 `shlex`）。
+**`split_agent_command`（win32 命令分词，M2 定稿为 fail-loud）**：实现已抽到 `compiler/agent_command_splitter.py`（`compiler/mermaid_parser.py` **再导出同一对象**，`__all__` 逐字未改）。语义：采用 `CommandLineToArgvW` 语义（优先 ctypes 原生调用，不可用时按 MS 规则的手写回退）——引号内的 `&`、`;`、`|`、`%` 是**字面量**，空词丢弃，未闭合引号仍报错；**非 win32 分支行为不变**（仍走 `shlex`）。**失败关闭（第七轮加固）**：回退实现对「引号段落内出现 `""`」这一病态形式**抛 `ValueError`**；win32 上 `split_agent_command` 还会**对拍原生与回退、不一致即抛**——**禁止静默按其中一路切分**（静默分歧会让同一条命令在不同环境被切成不同参数）。**诚实边界**：stdlib 随机语料 28687 条实测，静默分歧 **3567 → 2730**——回退侧守卫**不足以**清零，win32 的"零静默分歧"由**对拍**保证；**无 ctypes 的退化环境仍有约 9.5% 病态输入被静默错切**，已另开工单（忠实复现 `CommandLineToArgvW`，或原生不可用时直接拒绝切分）。
 
 claude/opencode 两个适配器 + registry 的声明式注册，具体命令按 design.md §2.2 调研结论（现场已查证）：
 - claude：`claude -p --output-format stream-json`

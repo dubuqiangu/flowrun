@@ -189,7 +189,14 @@ async def _execute_task(
     if not succeeded:
         append_node_failed(
             ledger, run_name, task_node.node_id,
-            {"exit_code": dispatch_result.exit_code, "timed_out": dispatch_result.timed_out},
+            {
+                "exit_code": dispatch_result.exit_code,
+                "timed_out": dispatch_result.timed_out,
+                # 真实原因显式落账：此前只写 exit_code/timed_out，读账者必须回到
+                # 相邻 agent_exited 反推"是超时还是非零退出"。reason 取值与既有
+                # 词汇一致（timed_out 见 design.md §4.4 的 node_failed 契约）。
+                "reason": "timed_out" if dispatch_result.timed_out else "nonzero_exit",
+            },
         )
         return
     missing_outputs = [

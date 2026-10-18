@@ -2,28 +2,27 @@
 
 argparse 子命令 → 各域模块调用的薄装配层，不承载业务逻辑：
 
-- ``compile <flow.mmd>``：编译校验，好图打印 FlowIR JSON；坏图打印行号错误
-  清单并退出码 3（编译/校验/IO 失败）；
+- ``compile <flow.mmd>``：编译校验，好图打印 FlowIR JSON；坏图打印行号错误清单；
 - ``run <flow.mmd> --workspace <dir> [--dispatch-timeout 秒]``：编译 → **校验
-  工作区身份（先于任何写入，不符退 4 且不污染工作区）** → 应用 todo 用户标记
-  （上轮等待点的勾选在此落账续跑）→ 生成 AGENTS.stub → run_flow。退出码：
-  flow_done=0 / halted=2 / 其余等待点=1；
+  工作区身份（先于任何写入；不符退 4 且不污染工作区）** → 应用 todo 用户标记 →
+  生成 AGENTS.stub → run_flow；
 - ``resume --flow <mmd> --workspace <dir>``：解除闸/暂停挂起——恢复 FlowState →
-  校验工作区与图身份 → 落 ``flow_resumed``。退出码：恢复成功=0 /
-  未处于暂停或已终止=1 / 工作区身份不匹配=4 / 工作区未初始化=5；
+  校验工作区与图身份 → 落 ``flow_resumed``（唯一 cli 恢复通道）；
 - ``approve|deny <node> --flow <mmd> --workspace <dir>``：人审裁决落
   ``human_resolved``（幂等：FlowState 已解决则跳过）；
 - ``status --workspace <dir> [--flow <mmd>]``：从 ledger+快照恢复 FlowState，
-  打印节点状态、token/hop 与三闸阈值、待人审节点；工作区未初始化退 5；
-- ``todo --workspace <dir> --flow <mmd>``：先应用 todo 用户标记，再重写投影；
-  工作区未初始化退 5。
+  打印节点状态、token/hop 与三闸阈值、待人审节点（只读）；
+- ``todo --workspace <dir> --flow <mmd>``：先应用 todo 用户标记，再重写投影。
 
 退出码契约（脚本可区分失败类别）：
 0=done / 1=waiting(paused/awaiting_human) / 2=halted /
-3=编译·校验·IO 失败 / 4=工作区与流程身份不匹配 / 5=工作区未初始化 /
-6=账本损坏（ledger 中段不可解析或哈希链断裂，需人工检查或换新工作区）。
-其中 3 同时覆盖"读流程文件失败"与"工作区写盘失败（账本 / todo / 产物等）"两种
-IO 失败——两者诊断文案不同（前者标明读流程文件，后者标明写盘）。
+3=编译·校验·IO 失败（读流程文件 / 写工作区盘）/ 4=工作区与流程身份不匹配 /
+5=工作区未初始化 / 6=账本损坏（中段不可解析或哈希链断裂，需人工检查或换新工作区）。
+
+2=halted（本轮定稿）：halted 是 flow_state 的终止态，M1 尚无其生产者（`flow_halted`
+随 T019 落地），故**不新增 `halt` 子命令**；但账本一旦已含 `flow_halted`，`run`
+（收口）/ `resume`（拒绝恢复）/ `status`（只读检出）三通道都以 2 上报，使其成为
+可被测试钉住的契约（tests/test_cli_halted_terminal.py）。
 
 异步入口统一 ``asyncio.run``（仅标准库）。所有对外输入只进结构化解析。
 """
@@ -246,14 +245,19 @@ def _handle_run(parsed_args: argparse.Namespace) -> int:
     finally:
         hooks_ledger.close()
 
-    # 内核写 todo 时拿不到闸 payload；这里用重开的账本补写富化的 PAUSED 头注释
+    # 内核写 todo 拿不到闸 payload：用重开的账本补写 PAUSED 头注释；同一句柄顺带
+    # 喂给摘要读 node_failed payload（T020j），读完即关，不额外开合账本。
     todo_ledger, todo_state = open_workspace_state(workspace)
     try:
         write_todo(flow_ir, todo_state, workspace / "todo.md", todo_ledger)
+        print_state_summary(
+            flow_ir,
+            final_state,
+            title=f"flowrun run: {flow_ir.run_name}",
+            ledger=todo_ledger,
+        )
     finally:
         todo_ledger.close()
-
-    print_state_summary(flow_ir, final_state, title=f"flowrun run: {flow_ir.run_name}")
     if final_state.is_done():
         return EXIT_FLOW_DONE
     if final_state.is_halted():
@@ -275,8 +279,10 @@ def _handle_resume(parsed_args: argparse.Namespace) -> int:
         # 被替换也拒绝。不符时由 main 统一捕获 FlowWorkspaceMismatchError（退 4）。
         verify_workspace_matches_flow(flow_ir, ledger)
         if flow_state.is_halted():
+            # halted 是终止态（并非"稍后可 resume 的挂起"）：拒绝恢复、按退出码表
+            # 以 2 上报，且不落任何事件（halted 不被 resume 覆盖，见 flow_state 投影）。
             print("flowrun: 流已终止（halted），拒绝恢复", file=sys.stderr)
-            return EXIT_WAITING
+            return EXIT_FLOW_HALTED
         if flow_state.is_done():
             print("flowrun: 流已完成（done），拒绝恢复", file=sys.stderr)
             return EXIT_WAITING
@@ -310,10 +316,14 @@ def _handle_status(parsed_args: argparse.Namespace) -> int:
     flow_ir = _compile_flow_file(Path(parsed_args.flow)) if parsed_args.flow else None
     ledger, flow_state = open_workspace_state(workspace)
     try:
-        print_state_summary(flow_ir, flow_state, title=f"flowrun status: {workspace}")
+        print_state_summary(
+            flow_ir, flow_state, title=f"flowrun status: {workspace}", ledger=ledger
+        )
+        # status 只读检出：查询成功即 0，唯独 halted 以 2 上报（与 run/resume 同口径）。
+        exit_code = EXIT_FLOW_HALTED if flow_state.is_halted() else EXIT_FLOW_DONE
     finally:
         ledger.close()
-    return EXIT_FLOW_DONE
+    return exit_code
 
 
 def _handle_todo(parsed_args: argparse.Namespace) -> int:

@@ -212,8 +212,8 @@ budget_tokens: 200000
 |---|---|
 | `agent_exited` | `{exit_code, timed_out, semantic_done[, tokens]}` |
 | `node_done` | `{artifacts:[...], attempt:N}`（**无** `exit` 字段） |
-| `node_failed` | `{reason: "missing_outputs"｜"timed_out"｜…}` |
-| `verdict` | `{edge, confidence, evidence:[...]}`（异常转人审时另带 `tripped`） |
+| `node_failed` | `{exit_code, timed_out, reason}`；`reason ∈ {"missing_outputs", "timed_out", "nonzero_exit", "dispatch_exception", "agent_unavailable", "interrupted_by_restart"}`，判定边界另为 `"<异常类型>: <消息>"`（截断 500 字符） |
+| `verdict` | `{edge, confidence, evidence:[...]}`（异常转人审时另带 `tripped`）；**`edge` = 命中边在 `flow_ir.edges` 中的声明序号**（与 `edge_taken` 幂等键的 `index` 同口径；tripped / 未命中记 `null`） |
 | `human_resolved` | `{decision: "approve"｜"deny"}` |
 | `user_directive` | `{directive: "pause"｜"skip"}`（**approve 走 `human_resolved`，不在此列**） |
 | `gate_tripped` | `{gate, actual, limit}` |
@@ -246,7 +246,7 @@ planned → ready → running → judging → done | failed | awaiting_human
 
 ### 5.2 谓词判定调用约定
 
-判定节点 D 的所有出边谓词 + 证据包（契约核对结果、diff、agent 自报）→ 判定 LLM（温度 0，JSON Schema 强约束）→ `{"edge":"D001->H001","confidence":0.9,"evidence":[...]}`。**edge 口径（M1 实况）**：投给判定的协议取值域是**命中边的编号**（`{source}->{target}`，见 packet_builder / AGENTS.stub）；引擎落账的 `verdict.payload.edge` 写的是**命中边的目标节点 id**（`engine_node_executors.py` 取 `chosen_edge_target`）。命中边表即转移；未命中或 confidence < 0.6 → 重试 1 次 → 仍败 → `gate_tripped` 转人审。同目标多入边时落账无法区分走的是哪条边——统一为边编号是 M2 待办（T020l）。
+判定节点 D 的所有出边谓词 + 证据包（契约核对结果、diff、agent 自报）→ 判定 LLM（温度 0，JSON Schema 强约束）→ `{"edge":"D001->H001","confidence":0.9,"evidence":[...]}`。**edge 口径分两层，别混**：投给判定的**协议取值域**是命中边的编号（`{source}->{target}`，见 packet_builder / AGENTS.stub）；引擎落账的 `verdict.payload.edge` 写的是**命中边在 `flow_ir.edges` 中的声明序号**（与 `edge_taken` 幂等键的 `index` 同口径；tripped / 未命中记 `null`）。该落账口径于 2026-10-19 起生效（T020l），此前写的是命中边的**目标节点 id**——属**跨版本不兼容**（按目标名解读该字段的外部读账者会失效）；但投影层不读该字段，**重放 / 续跑 / 幂等 / 工作区身份校验语义零变化**，故只需在升级说明里写一句口径变更，**不需要**换新工作区。命中边表即转移；未命中或 confidence < 0.6 → 重试 1 次 → 仍败 → `gate_tripped` 转人审。声明序号让我方账本能精确回指同源同目标的多条并行边（协议层 `{source}->{target}` 取值域本身的歧义仍在，属 T020 系列其他条目）。
 
 ### 5.3 闸（v2 修订：从 hard halt 降级为"转人审"；M1 定稿为"等待点优先 + 每工作区每闸名至多一次 + 人审可豁免 + hop/budget 独立判定"）
 

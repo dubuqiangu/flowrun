@@ -130,7 +130,11 @@ class KernelEngineTestCase(unittest.TestCase):
                          "未选中的分支不得被激活")
         ledger = self.reopened_ledger()
         verdict_events = support.events_of_type(ledger, "verdict", "D001")
-        self.assertEqual(verdict_events[0].payload["edge"], "T002")
+        # T020l 口径统一：edge 记命中边在 flow_ir.edges 里的**声明序号**（本图
+        # D001->T002 是第 2 条声明边 → 1），与 edge_taken 幂等键的 index 同口径。
+        # 旧断言钉的是缺陷行为：记目标节点名 "T002"——同一份账本里与候选边编号 /
+        # 幂等键两种口径并存，下游要反查，同源同目标并行边也分不开。
+        self.assertEqual(verdict_events[0].payload["edge"], 1)
         self.assertEqual(verdict_events[0].payload["confidence"], 0.92)
         taken_targets = [
             entry.payload["target"]

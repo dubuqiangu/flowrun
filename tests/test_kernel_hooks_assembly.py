@@ -16,7 +16,7 @@ if str(TESTS_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(TESTS_DIRECTORY))
 
 import kernel_test_support as support  # noqa: E402
-from flowrun.ir.schema import NODE_KIND_DECISION  # noqa: E402
+from flowrun.ir.schema import NODE_KIND_DECISION, NODE_KIND_JOIN  # noqa: E402
 from flowrun.kernel.engine_evidence import (  # noqa: E402
     EvidencePack,
     UpstreamNodeEvidence,
@@ -26,6 +26,7 @@ from flowrun.kernel.hooks_assembly import (  # noqa: E402
     _MERGED_AUDIT_TRUNCATION_MARKER,
     build_judge_evidence_pack,
 )
+from flowrun.state.ledger import EventLedger  # noqa: E402
 
 UPSTREAM_TAIL_CHARS = 1500  # 单路上游 < 2000（不被单路截断），但两路合并后超限
 
@@ -122,6 +123,147 @@ class HooksAssemblyEvidenceTestCase(unittest.TestCase):
         self.assertNotIn(_MERGED_AUDIT_TRUNCATION_MARKER, packed_evidence.audit_tail)
         for audit_text in short_text_by_node.values():
             self.assertIn(audit_text, packed_evidence.audit_tail)
+
+
+class HooksAssemblyContractGapTestCase(unittest.TestCase):
+    """产物契约缺口必须进判定证据（T020o 的 evidence 面直测）。
+
+    引擎侧"契约缺件 → ``node_failed(reason=missing_outputs)``"由引擎测试钉；
+    本文件钉判定侧**看得见缺件**：证据包要逐项给出 ``outputs_present`` 的真假，
+    多上游合并时产物键带节点前缀。否则同路径会互相覆盖，判定看到的是假的"齐"，
+    缺件节点会被误判为完成。
+
+    第三项覆盖 join 上游展开路径：join 自身无投递事件，证据要上溯到它的前驱
+    任务，并**按工作区现状**逐项核对前驱声明的产物（缺件记 False）。
+    """
+
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="flowrun_contract_gap_")
+        self.addCleanup(self._temp_dir.cleanup)
+        self.work_dir = Path(self._temp_dir.name)
+        self.decision_node = support.make_node("D001", kind=NODE_KIND_DECISION)
+
+    def upstream_evidence(
+        self, node_id: str, expected_outputs: list[str], present_outputs: list[str]
+    ) -> UpstreamNodeEvidence:
+        return UpstreamNodeEvidence(
+            node_id=node_id,
+            exit_code=0,
+            timed_out=False,
+            semantic_done=True,
+            expected_outputs=list(expected_outputs),
+            present_outputs=list(present_outputs),
+            stdout_file_name=None,
+        )
+
+    def fork_flow_ir(self) -> object:
+        first_upstream = support.make_node(
+            "T001", outputs=["src/auth.py", "test/auth.spec.ts"]
+        )
+        second_upstream = support.make_node("T002", outputs=["src/auth.py"])
+        return support.make_flow_ir(
+            [first_upstream, second_upstream, self.decision_node],
+            [
+                support.make_edge("T001", "D001"),
+                support.make_edge("T002", "D001"),
+            ],
+        )
+
+    def test_missing_contract_item_is_reported_as_false(self) -> None:
+        """声明了两件、工作区只有一件：证据必须给出 True/False 明细。"""
+        packed_evidence = build_judge_evidence_pack(
+            self.fork_flow_ir(),
+            EvidencePack(
+                decision_node_id="D001",
+                upstream_evidence=[
+                    self.upstream_evidence(
+                        "T001", ["src/auth.py", "test/auth.spec.ts"], ["src/auth.py"]
+                    )
+                ],
+            ),
+            self.work_dir,
+            [],
+        )
+
+        self.assertEqual(
+            packed_evidence.outputs_present,
+            {"src/auth.py": True, "test/auth.spec.ts": False},
+        )
+        self.assertEqual(packed_evidence.exit_code, 0)
+
+    def test_merged_outputs_are_prefixed_per_upstream_node(self) -> None:
+        """同路径产物分属两个上游：合并后键带节点前缀，缺件项仍是 False。"""
+        packed_evidence = build_judge_evidence_pack(
+            self.fork_flow_ir(),
+            EvidencePack(
+                decision_node_id="D001",
+                upstream_evidence=[
+                    self.upstream_evidence("T001", ["src/auth.py"], ["src/auth.py"]),
+                    self.upstream_evidence("T002", ["src/auth.py"], []),
+                ],
+            ),
+            self.work_dir,
+            [],
+        )
+
+        self.assertEqual(
+            packed_evidence.outputs_present,
+            {"T001:src/auth.py": True, "T002:src/auth.py": False},
+        )
+
+    def test_join_upstream_expands_to_predecessors_with_workspace_contract_check(self) -> None:
+        """join 上游展开为前驱任务；产物核对按工作区现状，缺件记 False。"""
+        first_predecessor = support.make_node(
+            "T001", outputs=["src/auth.py", "test/auth.spec.ts"]
+        )
+        join_node = support.make_node("J001", kind=NODE_KIND_JOIN)
+        flow_ir = support.make_flow_ir(
+            [first_predecessor, join_node, self.decision_node],
+            [
+                support.make_edge("T001", "J001"),
+                support.make_edge("J001", "D001"),
+            ],
+        )
+        (self.work_dir / "src").mkdir(parents=True, exist_ok=True)
+        (self.work_dir / "src" / "auth.py").write_text("print('ok')\n", encoding="utf-8")
+        ledger = EventLedger(self.work_dir / "ledger.jsonl")
+        self.addCleanup(ledger.close)
+        ledger.append(
+            "agent_exited",
+            {"exit_code": 0, "timed_out": False, "semantic_done": True},
+            f"{flow_ir.run_name}-T001-agent-exited-1",
+            flow_ir.run_name,
+            "T001",
+        )
+
+        packed_evidence = build_judge_evidence_pack(
+            flow_ir,
+            EvidencePack(
+                decision_node_id="D001",
+                upstream_evidence=[
+                    UpstreamNodeEvidence(
+                        node_id="J001",
+                        exit_code=None,
+                        timed_out=False,
+                        semantic_done=False,
+                        expected_outputs=[],
+                        present_outputs=[],
+                        stdout_file_name=None,
+                    )
+                ],
+            ),
+            self.work_dir,
+            ledger.entries(),
+        )
+
+        self.assertEqual(packed_evidence.node_id, "T001", "join 自身无投递事件，证据上溯到前驱")
+        self.assertEqual(packed_evidence.exit_code, 0, "退出码取账本最近一次 agent_exited")
+        self.assertTrue(packed_evidence.semantic_done)
+        self.assertEqual(
+            packed_evidence.outputs_present,
+            {"src/auth.py": True, "test/auth.spec.ts": False},
+            "工作区里缺的那一件必须记 False",
+        )
 
 
 if __name__ == "__main__":

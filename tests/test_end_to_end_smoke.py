@@ -164,7 +164,12 @@ class EndToEndSmokeTestCase(unittest.TestCase):
             entry for entry in reopened_ledger.entries() if entry.type == "verdict"
         ]
         self.assertEqual(len(verdict_entries), 1)
-        self.assertEqual(verdict_entries[0].payload["edge"], "H001", "判定应命中 ok 边")
+        # T020l 口径统一：edge 记命中边在 flow_ir.edges 里的**声明序号**（本图
+        # D001->H001 是第 4 条声明边 → 3），与 edge_taken 幂等键的 index 同口径。
+        # 旧断言钉的是缺陷行为：记目标节点名 "H001"，与候选边编号 / 幂等键并存。
+        self.assertEqual(
+            verdict_entries[0].payload["edge"], 3, "判定应命中 ok 边（D001->H001 的声明序号）"
+        )
 
         final_todo_text = self.read_todo_text(workspace)
         self.assertIn("- [x] H001 发布人审", final_todo_text)

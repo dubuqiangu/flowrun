@@ -323,6 +323,20 @@ def edge_idem_key(flow_ir: FlowIR, edge: EdgeSpec) -> str:
     边（如一条 when:all + 一条 timeout）会撞成同一键，第二条边被当成"重复投递"
     丢弃，账本少记一条边激活（审计失真）。**键格式变更 → 旧账本跨版本续跑时边
     幂等键不兼容**（旧键的 edge_taken 不再被认作"这条边已走过"）。
+
+    复杂度（T020i 实测、本轮**不改**）：本函数经 ``_edge_position_in_flow`` 对
+    ``flow_ir.edges`` 做一次 O(E) 对象同一性扫描；它被 ``has_edge_been_taken``
+    （本身还有 ``ledger.entries()`` 的一次 O(N) 列表拷贝）在每条候选出边上调用，
+    故边激活路径含 O(E²) 项。⑤ 的主循环另有**结构性**的 O(N·E)：
+    ``outgoing_activatable_edges`` → ``outgoing_edges`` 对每个节点都线性扫一遍
+    全部边。实测 ``activate_finished_nodes``：\"链 + 全部 done\"（目标皆终态，
+    不落 edge_taken）50/49 边 0.065ms → 800/799 边 8.5ms（翻倍 ≈ 3.2~4.0 倍，
+    二次项确认）；\"星 + 目标非终态\"（真落 edge_taken）则转为**每条边一次 fsync**
+    主导（50 边 ≈ 109ms，其中 50 次落账 fsync ≈ 100ms）。**决策：保留**。理由：
+    flow.mmd 是人写的，现实规模 ≤ 数十节点（整条热路径亚毫秒~百毫秒级）；给边身份
+    加索引会引入第二处\"边身份\"真相（与 ``verify_workspace_matches_flow`` 的图身份
+    契约耦合），风险大于收益。若将来出现自动生成的大图，再单独立项做索引化 +
+    批量落账。
     """
     edge_index = _edge_position_in_flow(flow_ir, edge)
     return (
