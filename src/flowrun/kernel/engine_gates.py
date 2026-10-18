@@ -69,6 +69,7 @@ __all__ = [
     "gate_has_been_settled",
     "append_gate_tripped",
     "trip_gate",
+    "append_node_failed",
     "resolve_failed_node_policy",
     "count_node_events",
     "latest_event_payload",
@@ -212,6 +213,23 @@ def append_gate_tripped(
             "limit": gate_finding.limit,
         },
         f"{run_name}-gate-{gate_finding.gate}-{gate_occurrence + 1}",
+        run_name,
+        node_id,
+    )
+
+
+def append_node_failed(
+    ledger: EventLedger, run_name: str, node_id: str, payload: dict
+) -> None:
+    """落 node_failed（幂等键带失败次数段，重试后的再次失败各自计一条）。
+
+    task / decision 两类执行器共用的失败事件生产者（原在 engine_node_executors）。
+    """
+    failure_occurrence = count_node_events(ledger, "node_failed", node_id) + 1
+    ledger.append(
+        "node_failed",
+        payload,
+        f"{run_name}-{node_id}-node-failed-{failure_occurrence}",
         run_name,
         node_id,
     )

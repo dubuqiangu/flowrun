@@ -35,9 +35,11 @@ flowrun/
 │   │   ├── cmd_line_safety.py   # 域C：cmd.exe 命令行参数渲染（不可安全表达即拒绝）
 │   │   ├── claude_code.py       # 域C
 │   │   └── opencode_cli.py      # 域C
-│   ├── kernel/                  # 域D：engine / engine_gates / engine_node_executors /
-│   │                            #     engine_graph / engine_evidence / hooks_assembly /
-│   │                            #     judge / packet_builder / stub_generator / todo_projection
+│   ├── kernel/                  # 域D：engine / engine_gates / engine_graph / engine_evidence /
+│   │                            #     engine_node_executors / decision_executor /
+│   │                            #     evidence_conversion / hooks_assembly / judge /
+│   │                            #     packet_builder / stub_generator / todo_projection /
+│   │                            #     todo_user_marks / state_summary / workspace_session
 │   └── cli.py                   # 域D 最后装配
 ├── scripts/verify-install.ps1   # 发布门禁：GitHub 直装自验证
 ├── tests/                       # 各域自带测试文件

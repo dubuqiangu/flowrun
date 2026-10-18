@@ -17,12 +17,15 @@ ledger 事件——重放等价），轮内用局部 pending 集合防重复调�
 判定节点投递（judge 调用也是一次 agent 投递）同样落 agent_dispatched——
 hop 闸因此能约束"判定↔任务"构成的循环；判定调用的 agent_exited/usage
 由域D1 judge 内部掌握，M1 不计入 token 账（见交付报告的已知限制）。
+
+判定执行器本体已拆到 ``kernel.decision_executor``（见该模块 docstring）；本模块
+再导出 ``describe_judge_failure`` / ``MAX_JUDGE_FAILURE_REASON_LENGTH`` 以保持既有
+import 路径不变。
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 from pathlib import Path
 
 from flowrun.ir.schema import (
@@ -36,25 +39,23 @@ from flowrun.ir.schema import (
 from flowrun.state.flow_state import STATUS_DONE, STATUS_READY, STATUS_SKIPPED, FlowState
 from flowrun.state.ledger import EventLedger
 
+from .decision_executor import (
+    MAX_JUDGE_FAILURE_REASON_LENGTH,
+    describe_judge_failure,
+    execute_decision,
+)
 from .engine_evidence import (
     EvidencePack,
     assemble_evidence_pack,
     extract_usage_tokens,
-    normalize_verdict,
 )
 from .engine_gates import (
-    GATE_ILLEGAL_EDGE,
-    GATE_VERDICT,
-    GateFinding,
-    append_edge_taken,
+    append_node_failed,
     count_node_events,
-    trip_gate,
 )
 from .engine_graph import (
     first_dispatch_timeout,
     incoming_edges,
-    outgoing_edges,
-    valid_decision_targets,
 )
 
 from typing import TYPE_CHECKING
@@ -108,7 +109,7 @@ async def advance_ready_nodes(
         node = flow_ir.nodes[node_id]
         if node.kind == NODE_KIND_DECISION:
             pending_node_ids.add(node_id)
-            await _execute_decision(flow_ir, node, flow_state, ledger, run_hooks, workspace, dispatch_results)
+            await execute_decision(flow_ir, node, flow_state, ledger, run_hooks, workspace, dispatch_results)
         elif node.kind == NODE_KIND_JOIN:
             pending_node_ids.add(node_id)
             _execute_join(flow_ir, node, flow_state, ledger)
@@ -134,7 +135,7 @@ async def _execute_task(
     run_name = flow_ir.run_name
     agent_name = task_node.agent or flow_ir.default_agent
     if not run_hooks.probe_agent(agent_name):
-        _append_node_failed(
+        append_node_failed(
             ledger, run_name, task_node.node_id,
             {"exit_code": None, "reason": "agent_unavailable", "agent": agent_name},
         )
@@ -158,7 +159,7 @@ async def _execute_task(
     except Exception as dispatch_error:
         # spawn 失败（如可执行缺失/被拒）等一切投递异常：记 node_failed 而非炸引擎，
         # 走该节点正常的 retry/失败处置策略（与 agent_exited 后的失败同路）。
-        _append_node_failed(
+        append_node_failed(
             ledger, run_name, task_node.node_id,
             {"exit_code": None, "reason": "dispatch_exception",
              "error": str(dispatch_error)},
@@ -186,7 +187,7 @@ async def _execute_task(
         and (dispatch_result.exit_code == 0 or dispatch_result.semantic_done)
     )
     if not succeeded:
-        _append_node_failed(
+        append_node_failed(
             ledger, run_name, task_node.node_id,
             {"exit_code": dispatch_result.exit_code, "timed_out": dispatch_result.timed_out},
         )
@@ -197,7 +198,7 @@ async def _execute_task(
         if not (workspace / output_path).exists()
     ]
     if missing_outputs:
-        _append_node_failed(
+        append_node_failed(
             ledger, run_name, task_node.node_id,
             {"exit_code": dispatch_result.exit_code, "reason": "missing_outputs",
              "missing": missing_outputs},
@@ -210,113 +211,6 @@ async def _execute_task(
         run_name,
         task_node.node_id,
     )
-
-
-async def _execute_decision(
-    flow_ir: FlowIR,
-    decision_node: NodeSpec,
-    flow_state: FlowState,
-    ledger: EventLedger,
-    run_hooks: "EngineHooks",
-    workspace: Path,
-    dispatch_results: dict[str, object],
-) -> None:
-    """判定节点：probe → 证据包 → judge（出边定时器为超时）→ verdict → 边 / 闸。
-
-    FIX-B4 兜底：判定 agent 探活失败落 ``gate_tripped(gate="verdict")`` 转人审
-    （不投递、不留悬挂 running、异常不穿透——穿透只会被 CLI 误报成"无法读取流程
-    文件"）。探活失败在落 agent_dispatched **之前**拦下。
-
-    judge 调用抛异常（如 agent 不在 PATH 时 spawn 抛 WinError 2）时，节点必须
-    落到**既有终态**：此处捕获后落 ``node_failed``（payload ``reason`` =
-    "异常类型: 消息"，截断），节点投影为 failed；其后由既有失败处置策略
-    （⑤ resolve_failed_node_policy）决定重入队 / retry 闸转人审。修复前这里
-    只落 verdict 闸、不落 node_failed，节点停留在非终态，靠下一轮的崩溃恢复
-    把它记成含糊的 "interrupted_by_restart"——判定失败的真实原因就此丢失，
-    resume 也推进不下去（死胡同）。
-    """
-    run_name = flow_ir.run_name
-    node_id = decision_node.node_id
-    judge_agent_name = decision_node.agent or flow_ir.default_agent
-    if not run_hooks.probe_agent(judge_agent_name):
-        _trip_gate(
-            ledger, run_name, node_id, GATE_VERDICT,
-            f"判定 agent '{judge_agent_name}' 不可用（探活未通过）",
-            "判定 agent 必须在 PATH 中可用",
-        )
-        return
-    attempt = count_node_events(ledger, "agent_dispatched", node_id) + 1
-    ledger.append(
-        "agent_dispatched",
-        {"attempt": attempt, "purpose": "judge"},
-        f"{run_name}-{node_id}-agent-dispatched-{attempt}",
-        run_name,
-        node_id,
-    )
-    evidence_pack = assemble_evidence_pack(
-        flow_ir, decision_node, flow_state, ledger, workspace, dispatch_results
-    )
-    judge_timeout_seconds = first_dispatch_timeout(flow_ir, node_id)
-    try:
-        verdict = run_hooks.judge_decision(
-            flow_ir, decision_node, evidence_pack,
-            workspace, workspace / "packets", judge_timeout_seconds,
-        )
-        if inspect.isawaitable(verdict):
-            verdict = await verdict
-    except Exception as judge_error:  # 判定执行失败：落 node_failed 终态 + reason，异常绝不穿透
-        _append_node_failed(
-            ledger, run_name, node_id,
-            {"exit_code": None, "reason": describe_judge_failure(judge_error)},
-        )
-        return
-    verdict_view = normalize_verdict(verdict)
-    ledger.append(
-        "verdict",
-        {
-            "edge": verdict_view.chosen_edge_target,
-            "confidence": verdict_view.confidence,
-            "evidence": verdict_view.evidence,
-            "tripped": verdict_view.tripped,
-        },
-        f"{run_name}-{node_id}-verdict-{attempt}",
-        run_name,
-        node_id,
-    )
-    if verdict_view.tripped:
-        _trip_gate(
-            ledger, run_name, node_id, GATE_VERDICT,
-            verdict_view.confidence, "confidence_floor",
-        )
-        return
-    valid_targets = valid_decision_targets(flow_ir, node_id)
-    if verdict_view.chosen_edge_target not in valid_targets:
-        _trip_gate(
-            ledger, run_name, node_id, GATE_ILLEGAL_EDGE,
-            verdict_view.chosen_edge_target, sorted(valid_targets),
-        )
-        return
-    chosen_edge = next(
-        edge
-        for edge in outgoing_edges(flow_ir, node_id)
-        if edge.target_id == verdict_view.chosen_edge_target
-    )
-    append_edge_taken(ledger, flow_ir, chosen_edge, chosen_edge.when)
-
-
-def _trip_gate(
-    ledger: EventLedger,
-    run_name: str,
-    node_id: str,
-    gate_name: str,
-    actual: object,
-    limit: object,
-) -> None:
-    """判定路径的统一闸出口（FIX-B4 兜底 / verdict / illegal_edge 共用）。
-
-    闸的一次性语义（每工作区每闸名至多一次）由 engine_gates.trip_gate 保证。
-    """
-    trip_gate(ledger, run_name, GateFinding(gate_name, actual, limit), node_id)
 
 
 def _execute_join(
@@ -360,29 +254,3 @@ def _request_human_review(flow_ir: FlowIR, human_node: NodeSpec, ledger: EventLe
         run_name,
         human_node.node_id,
     )
-
-
-def _append_node_failed(
-    ledger: EventLedger, run_name: str, node_id: str, payload: dict
-) -> None:
-    """落 node_failed（幂等键带失败次数段，重试后的再次失败各自计一条）。"""
-    failure_occurrence = count_node_events(ledger, "node_failed", node_id) + 1
-    ledger.append(
-        "node_failed",
-        payload,
-        f"{run_name}-{node_id}-node-failed-{failure_occurrence}",
-        run_name,
-        node_id,
-    )
-
-
-MAX_JUDGE_FAILURE_REASON_LENGTH = 500
-"""node_failed.payload["reason"] 的长度上限（别把整段堆栈 / 长消息塞进账本）。"""
-
-
-def describe_judge_failure(judge_error: Exception) -> str:
-    """判定调用的失败原因（"异常类型: 消息"，超长则截断）——进 node_failed payload。"""
-    failure_reason = f"{type(judge_error).__name__}: {judge_error}"
-    if len(failure_reason) > MAX_JUDGE_FAILURE_REASON_LENGTH:
-        failure_reason = failure_reason[:MAX_JUDGE_FAILURE_REASON_LENGTH] + "...(已截断)"
-    return failure_reason

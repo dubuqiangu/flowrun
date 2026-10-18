@@ -186,6 +186,36 @@
 - **含 `%` 的工作区路径 + `.cmd/.bat` agent 会被拒绝执行**：给出可执行建议（换个不含 `%` 的路径）；`.exe` 与 `powershell -File` 不受影响。
 - **judge 抛异常现在是"节点失败"而非"verdict 闸"**：落 `node_failed` 并按既有 `retry` 闸停住等人工；`flowrun status` 概览仍只显示状态词 `failed`，失败原因在账本 `node_failed.payload["reason"]`（CLI 概览暂不展示其正文，见 T020j）。
 
+### M1 结构拆分批次（第六轮，2026-10-18，已完成）
+
+**目标**：把超线文件按职责拆小，**纯搬移、行为零变化**（"改一处功能只碰一个文件"）。定量口径：全套 **455 条不变**；行数按字节级 `splitlines()` 计。
+
+**`src/`（Lane E）**
+
+| 文件 | 前 → 后 | 新模块（真实行数） |
+|---|---|---|
+| `kernel/todo_projection.py` | 457 → 166 | `kernel/todo_user_marks.py`(351) |
+| `cli.py` | 451 → 389 | `kernel/state_summary.py`(49)、`kernel/workspace_session.py`(63) |
+| `kernel/hooks_assembly.py` | 391 → 184 | `kernel/evidence_conversion.py`(225) |
+| `kernel/engine_node_executors.py` | 388 → 256 | `kernel/decision_executor.py`(176) |
+| `kernel/engine_gates.py` | 366 → 384 | （吸收共享的 `append_node_failed`，避免循环导入） |
+
+**`tests/`（Lane F）**
+
+| 原文件 | 前 → 拆为 |
+|---|---|
+| `test_cli.py` | 780 → 103 + `test_cli_resume.py`(267) + `test_cli_status_approval_todo.py`(144) + `test_cli_ledger_corruption.py`(118) + `test_cli_workspace_identity.py`(103) |
+| `test_ledger.py` | 499 → 178 + `test_ledger_projection.py`(151) + `test_ledger_incremental_verify.py`(119) + `test_ledger_edge_activation_guard.py`(70) |
+| `test_mermaid_parser.py` | 577 → 240 + `test_mermaid_frontmatter.py`(194) + `test_mermaid_agent_command_splitting.py`(176) |
+| `test_compiler_validator.py` | 531 → 180 + `test_compiler_golden_baseline.py`(146) + `test_compiler_edge_constraints.py`(123) + `test_compiler_output_path_escape.py`(114) |
+| `test_todo_projection.py` | 463 → 228 + `test_todo_projection_marker_instructions.py`(209) |
+
+跨文件共用的测试辅助上移到**不被 unittest 收集**的支持模块（文件名不带 `test` 前缀）：`cli_harness_support.py`(142)、`ledger_test_support.py`(67)、`mermaid_parser_support.py`(27)、`compiler_validator_support.py`(51)、`todo_projection_support.py`(87)。每个新测试文件既能被 `discover` 收集，也能 `python tests/<file>.py` 直跑（18/18 全绿）。
+
+**契约保持**：拆分后所有既有模块级公共名在**原路径**仍可导入（`todo_projection` / `hooks_assembly` / `engine_node_executors` 保留再导出；三个文件的 `__all__` **逐字未改**）。私有助手在提取时改为公共名（`_execute_decision` → `execute_decision`、`_trip_gate` → `trip_decision_gate`、`_append_node_failed` → `append_node_failed`、`_open_workspace_state` / `_workspace_ledger_path` / `_workspace_is_initialized` / `_append_human_resolution` / `_print_state_summary` 去掉下划线），属提取的一部分、**非公共 API 变更**。
+
+**验收证据**：`python -m unittest discover -s tests` → **455 tests OK**（多次复跑一致）；`-W always::ResourceWarning` → 455 OK 且 `ResourceWarning` **归零**；用 `TestLoader.discover` 对比拆分前后**叶子测试方法名多重集 `identical: True`**（无增 / 无删 / 无改名；`module.Class` 段随文件归属变化是拆分的必然，与既有 `test_ledger_readonly_view.py` 等先例一致）；全仓 108 个文件 **0 个 BOM、0 个 CRLF**；行数扫描仅余 `tests/test_kernel_engine_gates.py`(428)、`tests/test_kernel_judge.py`(424) 两个待拆（下一轮）。纯搬移核验：改文件 `git diff --stat` 为 **75 增 / 749 删**（删多于增 = 搬出特征），AST 级字符串字面量与 def/class/赋值名字多重集比对无删减。
+
 ### M1 审计遗留（第二轮新发现，并入 M2 处理）
 
 | 条目 | 现象 | 位置 |
@@ -207,11 +237,11 @@
 | 同源同目标多边被幂等合并（✅ 第五轮已修） | 多条无条件边被幂等键合并，丢失"哪条 when 边走"的审计事实 | `kernel/engine_gates.py` |
 | 恢复增量盲区 | 同进程内"原地改写已确认前缀"不可被增量路径察觉（跨实例首次仍全量、可检出） | `state/ledger.py` |
 | `split_agent_command` 语义边界 | 空参数丢弃的语义将来若需传空参数会变；手写回退实现对病态引号序列与原生可能不一致 | `compiler/mermaid_parser.py` |
-| 文件超 ~400 行待拆分（✅ 已入结构拆分批次） | 真实行数超线的既有文件（口径已修正，见下）：`tests/` 5 个 + 2 个 `src` 文件；建议纯搬移拆分、行为零变化 | `tests/test_cli.py`(779)、`tests/test_mermaid_parser.py`(577)、`tests/test_compiler_validator.py`(531)、`tests/test_ledger.py`(499)、`tests/test_todo_projection.py`(463)、`src/flowrun/kernel/todo_projection.py`(457)、`src/flowrun/cli.py`(451)、`tests/test_kernel_engine_gates.py`(428)、`tests/test_kernel_judge.py`(424) |
+| 文件超 ~400 行（✅ 第六轮已拆分，余 2 个） | 真实行数超线的既有文件（口径已修正，见下）。第六轮已把 `src/` 4 个 + `tests/` 5 个**纯搬移**拆到 ≤400；**尚余** `tests/test_kernel_engine_gates.py`(428)、`tests/test_kernel_judge.py`(424) | 见「M1 结构拆分批次（第六轮）」 |
 
 > **行数口径修正（2026-10-18）**：此前用 PowerShell `Measure-Object -Line` 统计，该 cmdlet **跳过空行**，全仓行数被低估约 15%（例：`cli.py` 记 360、实为 451）。改用字节级 `splitlines()` 重测后得左侧真实清单。第四轮起，新代码一律落到新模块/新测试文件（`compiler/limits.py`、`test_compiler_limits.py`、`test_cli_io_errors.py`、`test_todo_projection_human_guard.py`），未再给超线文件加厚。
 
-> **存量台账复核（T020i–T020p）**：`i` 部分覆盖（见下）、`j/k/l/m/n` 原因未变维持开放、`o` 维持开放、`p` 已于第三轮随根因修复关闭（见下）。
+> **存量台账复核（T020i–T020p）**：`i` 部分覆盖（见下）、`j/k/l/m` 原因未变维持开放、`n` 已于第六轮完成（见下）、`o` 维持开放、`p` 已于第三轮随根因修复关闭（见下）。
 
 ### M1 审计遗留（新发现，并入 M2 处理）
 
@@ -221,7 +251,7 @@
 - [ ] **T020k join 前驱不可达需提示**：join 存在永远无法到达的前驱时不报错、不设闸、不提示，流程静默悬挂。
 - [ ] **T020l verdict.edge 口径统一**：判定协议给的是边编号（`D001->H001`），落账写的是目标节点 id——统一为边编号（design.md §5.2 已记）。
 - [ ] **T020m 审计文件名去实例耦合**：审计文件名含进程/实例信息，跨 run 不稳定。
-- [ ] **T020n 内核模块再拆分**：`hooks_assembly.py`（391 行）/ `engine_node_executors.py`（375 行）物理行数偏高，建议把"证据转换"段与 decision 执行器抽为独立模块（均低于 ~400 硬阈值，非阻塞）。
+- [x] **T020n 内核模块再拆分（✅ 第六轮已完成）**：`hooks_assembly.py`(391) / `engine_node_executors.py`(388) 已把"证据转换"段与 decision 执行器抽为独立模块——`evidence_conversion.py`(225) / `decision_executor.py`(176)，原文件降到 184 / 256，公共名在原路径再导出（契约零变化）。
 - [ ] **T020o 测试缺口补齐**：`@pause` 引擎级、闸后停住/恢复的引擎侧直测、`missing_outputs` 分支、T012 桩行为验收、"exit≠0 但产物齐"的语义完成组合，逐条钉桩。（`@pause` 用例按 v2 行尾 HTML 注释形式 `<!-- @pause -->` 钉桩。）
 - [x] **T020p 测试卫生**：全套偶发 `ResourceWarning: unclosed file … ledger.jsonl`。（2026-10-16 复核定位两条产品根因：`kernel/engine.py` 引擎异常时账本句柄泄漏、`kernel/hooks_assembly.py` 只读判定代理自建 `EventLedger` 带写副作用。**2026-10-18 两条均已修复**；剩余噪声来自测试辅助 `reopened_ledger()` 未关句柄，已统一 `addCleanup` 并调整清理顺序修掉。复验：`python -W always::ResourceWarning -m unittest discover -s tests` → **386 OK 且 `ResourceWarning` 归零**。）
 

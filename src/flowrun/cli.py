@@ -48,17 +48,23 @@ from flowrun.kernel.hooks_assembly import (
     DEFAULT_DISPATCH_TIMEOUT_SECONDS,
     build_engine_hooks,
 )
+from flowrun.kernel.state_summary import print_state_summary
 from flowrun.kernel.stub_generator import generate_agents_stub
 from flowrun.kernel.todo_projection import (
     append_flow_resumed_event,
     apply_user_marks,
     write_todo,
 )
+from flowrun.kernel.workspace_session import (
+    append_human_resolution,
+    open_workspace_state,
+    workspace_is_initialized,
+    workspace_ledger_path,
+)
 from flowrun.state.flow_state import (
     STATUS_AWAITING_HUMAN,
     STATUS_DONE,
     STATUS_FAILED,
-    FlowState,
 )
 from flowrun.state.ledger import EventLedger, LedgerCorruptionError
 from flowrun.state.snapshots import SnapshotStore, recover_flow_state
@@ -132,7 +138,7 @@ def _describe_ledger_corruption(
     """
     workspace_text = getattr(parsed_args, "workspace", None)
     ledger_path_hint = (
-        f"账本 {_workspace_ledger_path(Path(workspace_text))}"
+        f"账本 {workspace_ledger_path(Path(workspace_text))}"
         if workspace_text
         else "工作区账本"
     )
@@ -221,7 +227,7 @@ def _handle_run(parsed_args: argparse.Namespace) -> int:
     # 不落用户标记、不生成 AGENTS.stub.md、不建 packets/audit/snapshots。
     # 校验逻辑唯一真相在 kernel.engine.verify_workspace_matches_flow（零写入纯查询）；
     # 空账本 = 全新工作区，天然通过，故 run 仍可直接冷启动新工作区（不退 5）。
-    prepare_ledger, prepare_state = _open_workspace_state(workspace)
+    prepare_ledger, prepare_state = open_workspace_state(workspace)
     try:
         verify_workspace_matches_flow(flow_ir, prepare_ledger)
         workspace.mkdir(parents=True, exist_ok=True)
@@ -241,13 +247,13 @@ def _handle_run(parsed_args: argparse.Namespace) -> int:
         hooks_ledger.close()
 
     # 内核写 todo 时拿不到闸 payload；这里用重开的账本补写富化的 PAUSED 头注释
-    todo_ledger, todo_state = _open_workspace_state(workspace)
+    todo_ledger, todo_state = open_workspace_state(workspace)
     try:
         write_todo(flow_ir, todo_state, workspace / "todo.md", todo_ledger)
     finally:
         todo_ledger.close()
 
-    _print_state_summary(flow_ir, final_state, title=f"flowrun run: {flow_ir.run_name}")
+    print_state_summary(flow_ir, final_state, title=f"flowrun run: {flow_ir.run_name}")
     if final_state.is_done():
         return EXIT_FLOW_DONE
     if final_state.is_halted():
@@ -259,10 +265,10 @@ def _handle_resume(parsed_args: argparse.Namespace) -> int:
     """解除闸/暂停挂起：身份校验 → 状态校验 → 落 flow_resumed（唯一 cli 通道）。"""
     flow_ir = _compile_flow_file(Path(parsed_args.flow))
     workspace = Path(parsed_args.workspace)
-    if not _workspace_is_initialized(workspace):
+    if not workspace_is_initialized(workspace):
         print("flowrun: 工作区未初始化（缺少 ledger.jsonl）", file=sys.stderr)
         return EXIT_WORKSPACE_MISSING
-    ledger, flow_state = _open_workspace_state(workspace)
+    ledger, flow_state = open_workspace_state(workspace)
     try:
         # 身份校验唯一真相在 kernel.engine.verify_workspace_matches_flow（零写入纯查询，
         # 可直接在已打开的账本上调用），与 run 同口径：不仅比 run 名，同 run 名而节点集
@@ -298,13 +304,13 @@ def _handle_deny(parsed_args: argparse.Namespace) -> int:
 
 def _handle_status(parsed_args: argparse.Namespace) -> int:
     workspace = Path(parsed_args.workspace)
-    if not _workspace_is_initialized(workspace):
+    if not workspace_is_initialized(workspace):
         print("flowrun: 工作区未初始化（缺少 ledger.jsonl）", file=sys.stderr)
         return EXIT_WORKSPACE_MISSING
     flow_ir = _compile_flow_file(Path(parsed_args.flow)) if parsed_args.flow else None
-    ledger, flow_state = _open_workspace_state(workspace)
+    ledger, flow_state = open_workspace_state(workspace)
     try:
-        _print_state_summary(flow_ir, flow_state, title=f"flowrun status: {workspace}")
+        print_state_summary(flow_ir, flow_state, title=f"flowrun status: {workspace}")
     finally:
         ledger.close()
     return EXIT_FLOW_DONE
@@ -313,10 +319,10 @@ def _handle_status(parsed_args: argparse.Namespace) -> int:
 def _handle_todo(parsed_args: argparse.Namespace) -> int:
     flow_ir = _compile_flow_file(Path(parsed_args.flow))
     workspace = Path(parsed_args.workspace)
-    if not _workspace_is_initialized(workspace):
+    if not workspace_is_initialized(workspace):
         print("flowrun: 工作区未初始化（缺少 ledger.jsonl）", file=sys.stderr)
         return EXIT_WORKSPACE_MISSING
-    ledger, flow_state = _open_workspace_state(workspace)
+    ledger, flow_state = open_workspace_state(workspace)
     try:
         applied_event_count = apply_user_marks(
             flow_ir, workspace / "todo.md", ledger, flow_state
@@ -345,23 +351,6 @@ def _compile_flow_file(flow_path: Path) -> FlowIR:
     return compile_flow_source(flow_source)
 
 
-def _open_workspace_state(workspace: Path) -> tuple[EventLedger, FlowState]:
-    """打开工作区账本并恢复 FlowState（快照 + 增量重放，等价全量重放）。"""
-    workspace = Path(workspace)
-    ledger = EventLedger(workspace / "ledger.jsonl")
-    snapshot_store = SnapshotStore(workspace / "snapshots")
-    return ledger, recover_flow_state(ledger, snapshot_store)
-
-
-def _workspace_ledger_path(workspace: Path) -> Path:
-    return Path(workspace) / "ledger.jsonl"
-
-
-def _workspace_is_initialized(workspace: Path) -> bool:
-    """工作区是否已初始化（以账本文件存在为唯一判据）。"""
-    return _workspace_ledger_path(workspace).exists()
-
-
 def _resolve_human_node(parsed_args: argparse.Namespace, decision: str) -> int:
     """approve/deny 共用装配：幂等校验 → 落 human_resolved → 重写 todo 投影。"""
     flow_ir = _compile_flow_file(Path(parsed_args.flow))
@@ -370,7 +359,7 @@ def _resolve_human_node(parsed_args: argparse.Namespace, decision: str) -> int:
         print(f"flowrun: 流程图中不存在节点 {node_id}", file=sys.stderr)
         return EXIT_WAITING
     workspace = Path(parsed_args.workspace)
-    ledger, flow_state = _open_workspace_state(workspace)
+    ledger, flow_state = open_workspace_state(workspace)
     try:
         node_status = flow_state.node_status(node_id)
         if decision == "approve" and node_status == STATUS_DONE:
@@ -386,7 +375,7 @@ def _resolve_human_node(parsed_args: argparse.Namespace, decision: str) -> int:
                 file=sys.stderr,
             )
             return EXIT_WAITING
-        _append_human_resolution(flow_ir, ledger, node_id, decision)
+        append_human_resolution(flow_ir, ledger, node_id, decision)
         updated_state = recover_flow_state(ledger, SnapshotStore(workspace / "snapshots"))
         write_todo(flow_ir, updated_state, workspace / "todo.md", ledger)
     finally:
@@ -394,57 +383,6 @@ def _resolve_human_node(parsed_args: argparse.Namespace, decision: str) -> int:
     decision_text = "通过" if decision == "approve" else "否决"
     print(f"{node_id} 人审裁决已落账：{decision_text}")
     return EXIT_FLOW_DONE
-
-
-def _append_human_resolution(
-    flow_ir: FlowIR, ledger: EventLedger, node_id: str, decision: str
-) -> None:
-    """落一条 human_resolved 事件（幂等键带 occurrence 段，与 todo 通道同构）。"""
-    prior_resolution_count = sum(
-        1
-        for entry in ledger.entries()
-        if entry.type == "human_resolved" and entry.node == node_id
-    )
-    ledger.append(
-        "human_resolved",
-        {"decision": decision},
-        f"{flow_ir.run_name}-{node_id}-human-resolved-{prior_resolution_count + 1}",
-        flow_ir.run_name,
-        node_id,
-    )
-
-
-def _print_state_summary(
-    flow_ir: FlowIR | None, flow_state: FlowState, title: str
-) -> None:
-    """打印节点状态 / 三闸计数 / 待人审节点（只读投影，无任何写通道）。"""
-    print(f"== {title} ==")
-    flow_phase = (
-        "done" if flow_state.is_done()
-        else "halted" if flow_state.is_halted()
-        else "paused" if flow_state.is_paused()
-        else "in-progress"
-    )
-    print(f"flow: {flow_phase}")
-    if flow_ir is not None:
-        for node_id, node_spec in flow_ir.nodes.items():
-            print(f"  {node_id} [{node_spec.kind}] {flow_state.node_status(node_id)}")
-    pending_human_nodes = sorted(flow_state.pending_human_nodes())
-    if pending_human_nodes:
-        print(f"待人审: {'、'.join(pending_human_nodes)}（勾选 todo.md 该行，或 approve/deny 子命令）")
-    budget_tokens = flow_ir.budget_tokens if flow_ir is not None else None
-    budget_display = f"/{budget_tokens}" if budget_tokens is not None else "/未知"
-    print(f"token_spent: {flow_state.token_spent()}{budget_display}")
-    hop_limit = 4 * len(flow_ir.nodes) if flow_ir is not None else "未知"
-    print(f"hop_count: {flow_state.hop_count()}/{hop_limit}（上限 = 4×节点数）")
-    tripped_gates = flow_state.tripped_gates()
-    if tripped_gates:
-        print(f"已触发闸: {'、'.join(tripped_gates)}")
-    if flow_state.is_paused():
-        print(
-            "提示: 流已暂停，运行 `flowrun resume`，"
-            "或在待恢复节点行的行尾用 HTML 注释标记 @resume 恢复"
-        )
 
 
 if __name__ == "__main__":
