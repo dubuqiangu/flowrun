@@ -21,7 +21,7 @@ T002[实现登录UI]  ─┴→ J001[集成准备] → D001{验收通过?}
 
 ```sh
 pip install "git+https://github.com/dubuqiangu/flowrun.git"
-# 私有仓库改用: pip install "git+ssh://git@github.com/dubuqiangu/flowrun.git"
+# 需要写权限(提 PR / 私有 fork)时改用 SSH: pip install "git+ssh://git@github.com/dubuqiangu/flowrun.git"
 ```
 
 写一个 `flow.mmd`(完整样例见 [examples/flow.mmd](examples/flow.mmd)):
@@ -96,4 +96,4 @@ pwsh scripts/verify-install.ps1
 
 ## 许可
 
-待定(M3-T027 定名查重与许可选择;当前倾向 Apache-2.0)。
+MIT License，全文见 [LICENSE](LICENSE)。

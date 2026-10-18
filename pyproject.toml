@@ -2,7 +2,7 @@
 # `pip install git+...` 直装与本地构建;未来发 PyPI 需改用其他分发名
 # (tasks.md M3-T027 定名查重)。
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,6 +10,8 @@ name = "flowrun"
 version = "0.1.0"
 description = "Mermaid 流程图驱动的多 Agent 编排运行时:编译器 + 事件账本状态层 + CLI Agent 适配 + 判定/人审引擎"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = []
 
