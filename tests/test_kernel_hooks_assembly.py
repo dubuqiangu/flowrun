@@ -16,6 +16,10 @@ if str(TESTS_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(TESTS_DIRECTORY))
 
 import kernel_test_support as support  # noqa: E402
+from flowrun.adapters.base import (  # noqa: E402
+    AUDIT_KIND_AGENT,
+    audit_stdout_relative_path,
+)
 from flowrun.ir.schema import NODE_KIND_DECISION, NODE_KIND_JOIN  # noqa: E402
 from flowrun.kernel.engine_evidence import (  # noqa: E402
     EvidencePack,
@@ -29,6 +33,12 @@ from flowrun.kernel.hooks_assembly import (  # noqa: E402
 from flowrun.state.ledger import EventLedger  # noqa: E402
 
 UPSTREAM_TAIL_CHARS = 1500  # 单路上游 < 2000（不被单路截断），但两路合并后超限
+UPSTREAM_ATTEMPT = 1  # 上游任务的第一次投递（与账本 attempt 口径一致）
+
+
+def audit_relative_path_for(node_id: str) -> str:
+    """上游审计 stdout 相对工作区根的路径（写侧/读侧共用的命名契约）。"""
+    return audit_stdout_relative_path(node_id, AUDIT_KIND_AGENT, UPSTREAM_ATTEMPT).as_posix()
 
 
 def make_audit_text(node_id: str) -> str:
@@ -57,7 +67,9 @@ class HooksAssemblyEvidenceTestCase(unittest.TestCase):
             "T002": make_audit_text("T002"),
         }
         for node_id, audit_text in self.audit_text_by_node.items():
-            (self.work_dir / f"{node_id}-stdout.log").write_text(audit_text, encoding="utf-8")
+            audit_path = self.work_dir / audit_relative_path_for(node_id)
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            audit_path.write_text(audit_text, encoding="utf-8")
 
     def tearDown(self) -> None:
         self._temp_dir.cleanup()
@@ -73,7 +85,7 @@ class HooksAssemblyEvidenceTestCase(unittest.TestCase):
                     semantic_done=True,
                     expected_outputs=[],
                     present_outputs=[],
-                    stdout_file_name=f"{node_id}-stdout.log",
+                    audit_relative_path=audit_relative_path_for(node_id),
                 )
                 for node_id in node_ids
             ],
@@ -114,7 +126,9 @@ class HooksAssemblyEvidenceTestCase(unittest.TestCase):
         """多路合并但总量未超限：两路证据都应完整保留且无标记。"""
         short_text_by_node = {"T001": "T001 短证据", "T002": "T002 短证据"}
         for node_id, audit_text in short_text_by_node.items():
-            (self.work_dir / f"{node_id}-stdout.log").write_text(audit_text, encoding="utf-8")
+            (self.work_dir / audit_relative_path_for(node_id)).write_text(
+                audit_text, encoding="utf-8"
+            )
 
         packed_evidence = build_judge_evidence_pack(
             self.flow_ir, self.build_engine_evidence(["T001", "T002"]), self.work_dir, []
@@ -153,7 +167,7 @@ class HooksAssemblyContractGapTestCase(unittest.TestCase):
             semantic_done=True,
             expected_outputs=list(expected_outputs),
             present_outputs=list(present_outputs),
-            stdout_file_name=None,
+            audit_relative_path=None,
         )
 
     def fork_flow_ir(self) -> object:
@@ -248,7 +262,7 @@ class HooksAssemblyContractGapTestCase(unittest.TestCase):
                         semantic_done=False,
                         expected_outputs=[],
                         present_outputs=[],
-                        stdout_file_name=None,
+                        audit_relative_path=None,
                     )
                 ],
             ),

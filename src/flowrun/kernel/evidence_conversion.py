@@ -7,7 +7,7 @@ packet 携带真实的上游证据。多个证据行合并进域D1 单节点 Evi
 产物键加 "节点ID:" 前缀、执行摘要逐节点写进 audit_tail，合并文本再做一次
 2000 字符总量截断（保尾部 + 省略标记，FIX-B5——单路读取时的截断挡不住
 k 路合并后的 k×2000）。已知限制：引擎侧证据不含 duration_seconds（恒 0）；
-账本不记 stdout 审计文件名，展开行的 audit_tail 为空。
+join 展开行的 audit_tail 按 "<节点>-<类别>-<attempt>" 命名由账本重建后读取。
 
 本模块从 ``kernel.hooks_assembly`` 原样拆出（纯搬移，签名与语义零变化）；
 原路径 ``flowrun.kernel.hooks_assembly`` 仍再导出 ``build_judge_evidence_pack``。
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from flowrun.ir.schema import NODE_KIND_JOIN, FlowIR, NodeSpec
+from flowrun.kernel.engine_evidence import audit_relative_path_for_node
 from flowrun.kernel.judge import EvidencePack
 
 __all__ = [
@@ -131,12 +132,16 @@ def _row_from_engine_upstream(upstream, work_dir: Path) -> _EvidenceRow:
             output_path: output_path in upstream.present_outputs
             for output_path in upstream.expected_outputs
         },
-        audit_tail=_read_audit_tail(work_dir, upstream.stdout_file_name),
+        audit_tail=_read_audit_tail(work_dir, upstream.audit_relative_path),
     )
 
 
 def _row_from_ledger(source_node: NodeSpec, work_dir: Path, ledger_entries: list) -> _EvidenceRow:
-    """从账本现算某前驱任务的证据行（join 展开路径用，重放等价）。"""
+    """从账本现算某前驱任务的证据行（join 展开路径用，重放等价）。
+
+    审计 stdout 路径同样由账本重建（``audit_relative_path_for_node``），故 join
+    展开的路径也带得上真实的上游 stdout 摘录。
+    """
     exit_payload = _latest_event_payload(ledger_entries, "agent_exited", source_node.node_id) or {}
     return _EvidenceRow(
         node_id=source_node.node_id,
@@ -147,7 +152,9 @@ def _row_from_ledger(source_node: NodeSpec, work_dir: Path, ledger_entries: list
             output_path: (work_dir / output_path).exists()
             for output_path in source_node.outputs
         },
-        audit_tail="",
+        audit_tail=_read_audit_tail(
+            work_dir, audit_relative_path_for_node(source_node, ledger_entries)
+        ),
     )
 
 
@@ -214,12 +221,18 @@ def _latest_event_payload(ledger_entries: list, event_type: str, node_id: str) -
     return None
 
 
-def _read_audit_tail(work_dir: Path, stdout_file_name: str | None) -> str:
-    """读上游 agent 的 stdout 审计尾部（约末 2000 字符）；不可得返回空串。"""
-    if not stdout_file_name:
+def _read_audit_tail(work_dir: Path, audit_relative_path: str | None) -> str:
+    """读上游 agent 的 stdout 审计尾部（约末 2000 字符）；不可得返回空串。
+
+    ``audit_relative_path`` 是相对工作区根的路径（如 ``audit/T001-agent-1.stdout.log``）；
+    文件缺失 / 路径为空一律返回空串——缺文件不是错误，不报错不崩。
+    """
+    if not audit_relative_path:
         return ""
     try:
-        audit_text = (work_dir / stdout_file_name).read_text(encoding="utf-8", errors="replace")
+        audit_text = (Path(work_dir) / audit_relative_path).read_text(
+            encoding="utf-8", errors="replace"
+        )
     except OSError:
         return ""
     return audit_text[-_AUDIT_TAIL_MAX_CHARS:]

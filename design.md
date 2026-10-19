@@ -306,6 +306,8 @@ planned → ready → running → judging → done | failed | awaiting_human
 | 被 spec-kit 的"够用"淹没 | 绝不抢单 agent 规格生成；钉死多 Agent 运行时+条件边+并行+断点续跑 |
 | acpx flow run 长成通用编排 | 退让预案：定位为"ACP-only 场景下游"，FlowRun 聚焦编译器与闸门 |
 | 双信号竞速误杀长任务 | 语义完成信号优先、超时上限放宽、kill 前写 `agent_exited` 事件留审计痕迹 |
+| 审计输出散落工作区根、名字不可推导 | 审计一律落 `workspace/audit/`，名 `<node_id>-<kind>-<attempt>.stdout.log`（`.stderr.log` 配对），`attempt` 由账本 `agent_dispatched` 条数重建；写侧/读侧共用同一命名函数（interfaces.md §4 审计契约） |
+| 账本被多个对象各自打开 | 单实例：`run_flow` 借用传入账本且永不 close，CLI 整轮一个实例，判定侧只持共享只读视图 |
 
 ---
 

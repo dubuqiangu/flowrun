@@ -91,12 +91,12 @@
 
 ### M1 遗留回流（收官核验发现，并入 M2 处理）
 
-- [ ] **T020a 判定调用 usage 入账**：`judge_decision` 回传 usage 数字，纳入 `payload.tokens` 与 budget 闸（当前判定消耗只进 hop 闸不计 token）。
-- [ ] **T020b 审计文件归位**：agent stdout/stderr 审计落 `audit/` 子目录而非 workspace 根；`agent_exited` 事件引用相对路径。
+- [x] **T020a 判定调用 usage 入账（✅ 第七轮已落地）**：`judge_decision` 回传 usage 数字，纳入 `payload.tokens` 与 budget 闸。判定侧只回传事实（`JudgeDispatchFacts`，不落盘），由 `decision_executor` 与 task 路径**同口径**落 `agent_exited`；**副作用**：判定花费现进 `token_spent()` 与 budget 闸。窄边界（崩溃恢复 × 判定超时）已于第八轮双向钉桩，判定维持走超时分支。
+- [x] **T020b 审计文件归位（✅ 第八轮已落地）**：agent stdout/stderr 审计落 `audit/` 子目录而非工作区根；命名 `<node_id>-<kind>-<attempt>.stdout.log`（`.stderr.log` 配对），`kind ∈ {agent, judge, no-adapter}`，`attempt` 由账本 `agent_dispatched` 条数重建；证据/`agent_exited` 引用**相对工作区根**的路径。写侧与读侧共用同一命名函数（`adapters/audit_paths.py`），缺文件退空 `audit_tail`、绝不报错。
 - [x] **T020c apply_user_marks 降噪**：done 派生的 `[x]` 行不再每轮重复告警。（2026-10-16 审计批次 C 线落地：非人审节点的派生勾选静默跳过，仅"未生效过"的标记告警并钉桩测试。）
-- [ ] **T020d EventLedger 单实例化**：judge 收 ledger 参数改为收账本路径或共享单写者，消除 hooks_assembly 里"每次判读重建只读 ledger"的架构债。
+- [x] **T020d EventLedger 单实例化（✅ 第八轮已落地）**：`run_flow(..., ledger=None)` 改为**借用语义**——传入即共用（**永不 close**），只有 `None` 时自建并自管；`cli._handle_run` 整轮只开一个 `EventLedger` 并在结束时关一次（"重开只为读 PAUSED 头部"的旧分支已删）；`hooks_assembly._JudgeLedgerRecorder(ledger)` 持共享实例、只读不写（单一写者纪律）。
 - [ ] **T020e 失败处置语义定稿**：无 retry 边的失败节点当前触发 `gate_tripped(gate="retry", limit=0)`，与三闸语义混淆——定稿为独立的人审等待事件（`node_failed` → 明确的转人审标记），并区分 gate_tripped。
-- [ ] **T020f FallbackAdapter 结构化提取**：支持从任意 agent 输出提取 usage（正则或标记约定），假 agent / 长尾 CLI 下 token_spent 不再恒 0。
+- [x] **T020f FallbackAdapter 结构化提取（✅ 第八轮已落地）**：改为**声明式约定**——行内**最后一个**顶层 JSON 对象若含 `usage` / `total_tokens` 键（明细 dict 或数字，bool/字符串不算）即搬进 `structured_result`，键名与 `extract_usage_tokens` **同一口径**（总数优先、分量不重复累加），且**绝不置位语义完成信号**（兜底适配器仍只认"退出码 + 超时"）。长尾 CLI 的 **task 路径** `token_spent` 不再恒 0，端到端已钉进 `agent_exited.tokens` 并可触发 budget 闸。原"测试侧适配器去重"读法经核验**无重复可去**（唯一计数适配器已在共享支持模块）。
 - [ ] **T020g opencode 语义信号真机采样**：采集 `opencode run --format json` 真实输出样例，核定 idle/end 判定形态（当前为两类合理形态猜测实现）。
 - [x] **T020h 文档位置修正**：`compile_flow_source` 实际位于 `flowrun.compiler.validator`（简报曾误标 mermaid_parser）。**核验结论**：全文检索 `*.md` 后，interfaces.md 目录树与各任务书均无该误标引用，无需改动即关闭。
 
@@ -235,14 +235,14 @@
 **判定/证据面（Lane H）**
 - [x] **T020a 判定 usage 入账**：`judge.py` 新增 `JudgeDispatchFacts`（只回传事实、不落盘，守单一写者纪律）；`decision_executor.py` 与 task 路径**同口径**落 `agent_exited`（`tokens` 仅 >0 写、幂等键 `{run}-{node}-agent-exited-{attempt}`、位置在 `verdict` 之前）；用量复用同一个 `extract_usage_tokens`，**结构化结果与判定协议自己的结构化通道只取其一**（相加即重复计数），`tokens` 跨重试累加。**有意副作用**：判定花费从此进 `token_spent()` 与 budget 闸。
 - [x] **T020l verdict.edge**：详见上方台账行。
-- **T020f**：测试侧**无重复适配器可去**；台账原文那条实指**生产侧** `fallback_adapter.py`（长尾 CLI 下 task 路径 `tokens` 恒 0）→ 另开工单，**维持开放**。
+- **T020f**：测试侧**无重复适配器可去**；台账原文那条实指**生产侧** `fallback_adapter.py`（长尾 CLI 下 task 路径 `tokens` 恒 0）→ 转第八轮开工单，**已于第八轮落地**（见 `M1 遗留回流` 表）。
 - **T020o**：部分闭合（详见台账行；引擎侧仍缺 2 条）。
 
 **验收证据**：`python -m unittest discover -s tests` → **491 tests OK**（455 + 控制面 20 + 判定面 16；两条线的新测试都被收集，条数只增不减）；`-W always::ResourceWarning` → 491 OK 且 `ResourceWarning` **归零**；全仓 **119 文件 0 BOM / 0 CRLF / 无超 400 行**；两条线**在同一文件 `tests/test_kernel_engine.py` 上的改动经核对共存、互不覆盖**。每条修复都做了"回退即变红"：控制面 —— 条目1 两红 / 条目2 两错 / 条目3 一红 / 条目5 三红 / 条目6a 四红 / 条目6b 一红；判定面 —— T020a 三红（回退 judge 侧另加一条收集错）、T020l 两红。
 
 **本批新增待办（另开，勿与已闭合项混记）**
-- **T020a 窄边界语义**：判定投递两轮皆超时（tripped）后、`verdict` 闸之前进程崩溃时，恢复路径会读到那条 `agent_exited(timed_out=True)` 而走**超时分支**而非 retry 闸。语义上更正确（判定 agent 确实超时了），但**无用例覆盖**，需一条用例 + 一次语义确认（倾向上维持现状）。
-- **T020f 生产侧**：`fallback_adapter.py` 从任意 agent 输出提取 usage（task 路径 `tokens` 恒 0）；判定路径已由 T020a 顺带缓解。
+- **T020a 窄边界语义**：判定投递两轮皆超时（tripped）后、`verdict` 闸之前进程崩溃时，恢复路径会读到那条 `agent_exited(timed_out=True)` 而走**超时分支**而非 retry 闸。语义上更正确（判定 agent 确实超时了），修复前判定节点没有 `agent_exited`，不会触发这条组合。**第八轮已双向钉桩并确认维持现状**：`test_crashed_timed_out_decision_dispatch_walks_timeout_branch`（走超时分支）与 `test_crashed_decision_dispatch_without_exit_event_trips_retry_gate`（无 exit 事件时仍走 retry 闸）——两个方向都钉住，语义不再处于"无人覆盖"状态。
+- **T020f 生产侧**：`fallback_adapter.py` 从任意 agent 输出提取 usage（task 路径 `tokens` 恒 0）；判定路径已由 T020a 顺带缓解。**✅ 第八轮已落地**：改为声明式约定（行内最后一个 JSON 对象含 `usage`/`total_tokens`），键名与 `extract_usage_tokens` 同口径，端到端已钉进 `agent_exited.tokens` 并可触发 budget 闸；兜底适配器的语义完成信号恒 False 不变。
 - **退化 win32 切分**：无 ctypes 时仍有约 9.5% 病态输入被静默错切（选项：忠实复现 `CommandLineToArgvW`，或原生不可用时直接拒绝切分）。
 - **大图性能（若开）**：`outgoing_edges` 建索引 + `has_edge_been_taken` 批量读 + `describe_join_blocking` 的 O(J·E) 一并处理。
 
@@ -291,9 +291,41 @@
 - [x] **T020j 失败归因写进 payload（✅ 第七轮已修）**：`node_failed` 不再只写通用 reason——现写 `{exit_code, timed_out, reason}`，`reason ∈ {timed_out, nonzero_exit, missing_outputs, dispatch_exception, agent_unavailable, interrupted_by_restart}` 或 judge 异常串；`run`/`status` 概览直接打印 `失败: <node>（exit_code=… reason=… timed_out=…）`，不必再反推邻接事件。
 - [x] **T020k join 前驱不可达需提示（✅ 第七轮已修，口径＝展示层诊断）**：`kernel/state_summary.py::describe_join_blocking` 区分「join 等待 …（正常推进中）」与「join 阻塞 … 已 failed，永远不会到达」。**这是展示诊断，不落事件、不设闸**，流程仍停在等待点等人工——刻意不与 design §5.3 的闸语义混用。
 - [x] **T020l verdict.edge 口径统一（✅ 第七轮已落地）**：统一为**命中边在 `flow_ir.edges` 中的声明序号**（与 `edge_taken` 幂等键 `index` 同口径，复用 `_edge_position_in_flow` 保证不漂移）；tripped / 未命中记 `null`。**跨版本不兼容**（`edge` 由字符串＝目标节点名 → 整数）：但投影层不读该字段 → 重放 / 续跑 / 幂等 / 工作区身份**零变化**，**无需换新工作区**，只在升级说明写一句口径变更即可。design.md §4.4 / §5.2 已同步。
-- [ ] **T020m 审计文件名去实例耦合**：审计文件名含进程/实例信息，跨 run 不稳定。
+- [ ] **T020m 审计文件名去实例耦合（✅ 第八轮已闭合，随 T020b 一起落地）**：审计文件名不再含进程/实例信息，改由「节点 + 类别 + 账本 attempt」唯一确定，跨 run、跨进程可精确重建（同一 attempt 重投覆盖同名文件，不产生第二种命名）。
+
+### M1 审计/账本平面批次（第八轮，2026-10-19，已完成）
+
+**范围**：T020b（审计归位）+ T020d（账本单实例）+ T020m（命名去实例耦合），另把 T020f / T020a / T020o 的收尾一并落地；纯实现 + 测试，无新增命令、无格式迁移脚本。
+
+**改动点**
+
+| 模块 | 变更 |
+|---|---|
+| `adapters/audit_paths.py`（新增，85 行） | 审计命名族唯一真相：`AUDIT_DIRECTORY_NAME`、`AUDIT_KIND_{AGENT,JUDGE,NO_ADAPTER}`、`audit_stdout_file_name` / `audit_stderr_file_name` / `audit_stdout_relative_path`、`dispatch_attempt_from_ledger_entries`、`AuditArtifact` |
+| `adapters/base.py` | 命名族改为再导出；`dispatch(..., *, audit_artifact=None)` 一律落 `work_dir/audit/` |
+| `adapters/windows_launch.py`（新增，125 行） | `WindowsLaunchPlan` / `plan_windows_command_launch` / `taskkill_process_tree` 从 `base.py` 纯搬移，`base.py` 再导出 |
+| `kernel/hooks_assembly.py` | `dispatch_task` 由账本推导 attempt 并传 `AuditArtifact`；`_JudgeLedgerRecorder(ledger)` 共享只读视图；`_unavailable_agent_result(node, agent_name, audit_directory, attempt)` |
+| `kernel/engine.py` | `run_flow(..., ledger=None)` 借用语义（传即共用、不 close） |
+| `cli.py` | 整轮单账本实例，删掉"重开读 PAUSED 头部" |
+| `kernel/engine_evidence.py` | `audit_relative_path_for_node(node, ledger_entries)`；`UpstreamNodeEvidence.stdout_file_name` → `audit_relative_path` |
+| `kernel/evidence_conversion.py` | `_read_audit_tail(work_dir, audit_relative_path)`，缺文件退空串 |
+| `kernel/judge.py` | 判定投递自带 `AuditArtifact` 并从规范路径读回 stdout；verdict 文本解析抽到 `kernel/verdict_parsing.py`(110) 再导出 |
+| `kernel/fallback_adapter.py` | 声明式约定提取 usage（行内最后一个含 `usage`/`total_tokens` 的顶层 JSON），语义完成信号恒 False |
+
+**新增测试**：`test_audit_artifact_layout.py`(6)、`test_fallback_usage_extraction.py`、`test_kernel_engine_pause_marker.py`、`test_kernel_engine_terminal_state_guards.py`（+2 条）、`test_kernel_engine_gates_recovery.py`（+3 条）；`test_kernel_judge_usage_accounting.py` 按协议层/引擎层拆为 245 + `test_kernel_judge_usage_engine_accounting.py`(187)。
+
+**验收证据**：`python -m unittest discover -s tests` → **520 tests OK**（491 → 520，只增不减）；`-W always::ResourceWarning` → 520 OK 且 `ResourceWarning` **0**；全仓 `git ls-files --eol`（含未跟踪）**全 LF、无 BOM**；真实行数（`splitlines()`）**无一个 > 400**（最高 `engine_gates.py` 398）。**回退即变红**：审计命名退回实例耦合 → 5 红；`run_flow` 退回自行 close 借用账本 → 红；读侧不认账本重建路径 → 红（三次实验后文件字节级还原，sha256 一致）。T020f 回退 `parse_line` 提取 → 11 红 + 1 错。
+
+#### 本轮行为变更（面向用户，升级前请读）
+
+- **审计文件换位置与命名**：由工作区根的随机名改为 `audit/<node_id>-<kind>-<attempt>.stdout.log`（`.stderr.log` 配对）。按旧名去找审计文件的脚本需要改。
+- **旧工作区的旧审计文件不迁移**：升级后旧账本仍可续跑（身份 / 幂等 / 重放语义零变化，**不需要换新工作区**），但历史审计文件不会被搬进 `audit/`，判定证据里的 `audit_tail` 对旧记录退化为空串。
+- **同一 attempt 重投覆盖同名审计文件**：不再保留"每次投递一份"的副本。
+- **`run_flow` 传入账本时不再自行关闭**：由调用方负责生命周期（CLI 已按此改造）。自己传账本的集成代码若依赖 `run_flow` 关闭它，关闭动作现在必须自己做。
+
+---
 - [x] **T020n 内核模块再拆分（✅ 第六轮已完成）**：`hooks_assembly.py`(391) / `engine_node_executors.py`(388) 已把"证据转换"段与 decision 执行器抽为独立模块——`evidence_conversion.py`(225) / `decision_executor.py`(176)，原文件降到 184 / 256，公共名在原路径再导出（契约零变化）。
-- [ ] **T020o 测试缺口补齐（🟡 第七轮部分闭合）**：已闭合——`missing_outputs` 分支（`tests/test_kernel_engine_failure_attribution.py`，含缺件清单）、T012 桩行为验收（`tests/test_stub_generator.py`）、闸后停住/恢复的引擎侧直测（`test_kernel_engine_gate_exemption.py` / `test_kernel_judge_failure_terminal.py` / `test_kernel_engine_terminal_state_guards.py`）、evidence 面 3 条（`tests/test_kernel_hooks_assembly.py::HooksAssemblyContractGapTestCase`：缺件 `outputs_present=False`、多上游合并产物键带节点前缀、join 上游上溯展开逐项核对）。**仍缺 2 条（引擎侧，待办）**：① `@pause` 的**引擎级**直测（现有只有 CLI 级与投影级，全部为 `<!-- @pause -->` 行尾注释形式）；② 「`exit≠0` + `semantic_done=True` + 产物齐」的**节点级**组合（适配层已钉，引擎节点级无测，而 `succeeded = not timed_out and (exit_code == 0 or semantic_done)` 正靠它成立）。
+- [x] **T020o 测试缺口补齐（✅ 第八轮全部闭合）**：已闭合——`missing_outputs` 分支（`tests/test_kernel_engine_failure_attribution.py`，含缺件清单）、T012 桩行为验收（`tests/test_stub_generator.py`）、闸后停住/恢复的引擎侧直测（`test_kernel_engine_gate_exemption.py` / `test_kernel_judge_failure_terminal.py` / `test_kernel_engine_terminal_state_guards.py`）、evidence 面 3 条（`tests/test_kernel_hooks_assembly.py::HooksAssemblyContractGapTestCase`：缺件 `outputs_present=False`、多上游合并产物键带节点前缀、join 上游上溯展开逐项核对）。**第八轮补齐最后 2 条（引擎侧）**：① `@pause` 的**引擎级**直测 `tests/test_kernel_engine_pause_marker.py::EnginePauseMarkerTestCase::test_pause_marker_suspends_engine_then_resume_continues`（驱动 `run_flow`，断言挂起 + 复跑续推）；② 「`exit≠0` + `semantic_done=True` + 产物齐」的**节点级**组合 `tests/test_kernel_engine_terminal_state_guards.py::test_nonzero_exit_with_semantic_done_and_outputs_completes_node`（断言 `node_done` 且无 `node_failed`）+ 反向 `test_nonzero_exit_with_semantic_done_but_missing_output_still_fails`（产物不齐仍失败）。
 - [x] **T020p 测试卫生**：全套偶发 `ResourceWarning: unclosed file … ledger.jsonl`。（2026-10-16 复核定位两条产品根因：`kernel/engine.py` 引擎异常时账本句柄泄漏、`kernel/hooks_assembly.py` 只读判定代理自建 `EventLedger` 带写副作用。**2026-10-18 两条均已修复**；剩余噪声来自测试辅助 `reopened_ledger()` 未关句柄，已统一 `addCleanup` 并调整清理顺序修掉。复验：`python -W always::ResourceWarning -m unittest discover -s tests` → **386 OK 且 `ResourceWarning` 归零**。）
 
 ---

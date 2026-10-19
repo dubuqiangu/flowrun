@@ -2,7 +2,8 @@
 
 覆盖 FIX-B1（已 done 的 join 不被 skipped 源的分支边复活）与 K3（重试耗尽的 failed
 节点不被晚到入边复活，resume 后也不得绕过重试策略与 retry 闸），另含两条
-"合法重投 / 超时分支仍生效"的边界。
+"合法重投 / 超时分支仍生效"的边界，以及节点成功判定的双信号组合（T020o 缺口②：
+``exit≠0`` + ``semantic_done=True`` + 产物齐 → ``node_done``，无 ``node_failed``）。
 
 直跑：python -m unittest discover -s tests
 """
@@ -199,6 +200,62 @@ class KernelEngineTerminalStateGuardsTestCase(KernelGatesHarnessTestCase):
             for edge_entry in support.events_of_type(self.reopened_ledger(), "edge_taken")
         ]
         self.assertEqual(taken_targets, ["T002"])
+
+    # ---------------------------------------------------------------- 节点成功判定（双信号组合）
+
+    def test_nonzero_exit_with_semantic_done_and_outputs_completes_node(self) -> None:
+        """T020o 缺口②：``exit≠0`` + ``semantic_done=True`` + 产物齐 → ``node_done``。
+
+        成功判定是 ``not timed_out and (exit_code == 0 or semantic_done)``
+        （engine_node_executors）：headless CLI 常见的"跑完已报完成、但退出码非零"
+        正是靠那个 ``or`` 成立的——agent 已把产物写好并给出语义完成信号，就不该因
+        非零退出码把节点判失败。修复前判定节点没有 agent_exited，这条组合在节点级
+        一直无测；本用例把它钉住：node_done 恰一条、node_failed 零条、不落 retry 闸。
+        """
+        task_node = support.make_node(
+            "T001", label="非零退出但已报完成", outputs=["report/out.txt"]
+        )
+        flow_ir = support.make_flow_ir([task_node], [])
+        (self.workspace / "report").mkdir(parents=True, exist_ok=True)
+        (self.workspace / "report/out.txt").write_text("done", encoding="utf-8")
+        self.stubs.script_dispatch_result(
+            "T001", support.make_dispatch_result(exit_code=1, semantic_done=True)
+        )
+
+        final_state = self.run_flow_once(flow_ir)
+
+        self.assertTrue(final_state.is_done())
+        self.assertEqual(final_state.node_status("T001"), "done")
+        ledger = self.reopened_ledger()
+        self.assertEqual(
+            support.events_of_type(ledger, "node_failed", "T001"), [],
+            "语义完成信号 + 产物齐时，非零退出码不得把节点判失败",
+        )
+        self.assertEqual(len(support.events_of_type(ledger, "node_done", "T001")), 1)
+        self.assertNotIn("retry", final_state.tripped_gates())
+        exit_events = support.events_of_type(ledger, "agent_exited", "T001")
+        self.assertEqual(exit_events[0].payload["exit_code"], 1)
+        self.assertTrue(exit_events[0].payload["semantic_done"])
+
+    def test_nonzero_exit_with_semantic_done_but_missing_output_still_fails(self) -> None:
+        """对照：``semantic_done`` 只替代退出码，不替代产物契约——产物缺失仍 node_failed。"""
+        task_node = support.make_node(
+            "T001", label="非零退出但已报完成", outputs=["report/out.txt"]
+        )
+        flow_ir = support.make_flow_ir([task_node], [])
+        self.stubs.script_dispatch_result(
+            "T001", support.make_dispatch_result(exit_code=1, semantic_done=True)
+        )
+
+        final_state = self.run_flow_once(flow_ir)
+
+        self.assertEqual(final_state.node_status("T001"), "failed")
+        failed_events = support.events_of_type(
+            self.reopened_ledger(), "node_failed", "T001"
+        )
+        self.assertEqual(len(failed_events), 1)
+        self.assertEqual(failed_events[0].payload["reason"], "missing_outputs")
+        self.assertEqual(failed_events[0].payload["missing"], ["report/out.txt"])
 
 
 if __name__ == "__main__":

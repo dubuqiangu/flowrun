@@ -31,7 +31,9 @@ flowrun/
 │   │   ├── flow_state.py        # 域B：重放投影 + 幂等去重
 │   │   └── snapshots.py         # 域B：快照与恢复
 │   ├── adapters/
-│   │   ├── base.py              # 域C：适配器接口 + 双信号退出监视器
+│   │   ├── base.py              # 域C：适配器接口 + 双信号退出监视器（审计命名族再导出）
+│   │   ├── audit_paths.py       # 域C：审计产物命名/路径唯一真相（写侧/读侧共用）
+│   │   ├── windows_launch.py    # 域C：Windows 启动计划 + 进程树终结
 │   │   ├── registry.py          # 域C：声明式注册 + which 探测 + 注入模式 + 注入策略校验
 │   │   ├── cmd_line_safety.py   # 域C：cmd.exe 命令行参数渲染（不可安全表达即拒绝）
 │   │   ├── claude_code.py       # 域C
@@ -39,8 +41,9 @@ flowrun/
 │   ├── kernel/                  # 域D：engine / engine_gates / engine_graph / engine_evidence /
 │   │                            #     engine_node_executors / decision_executor /
 │   │                            #     evidence_conversion / hooks_assembly / judge /
-│   │                            #     packet_builder / stub_generator / todo_projection /
-│   │                            #     todo_user_marks / state_summary / workspace_session
+│   │                            #     verdict_parsing / packet_builder / stub_generator /
+│   │                            #     todo_projection / todo_user_marks / state_summary /
+│   │                            #     workspace_session
 │   └── cli.py                   # 域D 最后装配
 ├── scripts/verify-install.ps1   # 发布门禁：GitHub 直装自验证
 ├── tests/                       # 各域自带测试文件
@@ -140,6 +143,36 @@ class AgentAdapter(Protocol):
 ```
 
 > **实现超出本冻结面（M1 事实，待并入正式契约）**：`DispatchResult` 另含 `structured_result`（适配器从输出提取的结构化结果）与 `stderr_path`（stderr 审计落盘路径）；`EventLedger` 另含只读 API `last_seq` / `head_hash` / `close()` 与 `with` 上下文管理器支持。**M2 追加**：`EventLedger.open_readonly()` 为面向旁路读取的只读视图（写者构造时截断崩溃尾行，只读视图一律不截断、不持写句柄），判定等只读路径一律走该视图。
+
+### 审计产物布局与命名契约（第八轮定稿）
+
+```python
+# adapters/audit_paths.py（命名族唯一真相；base.py 原样再导出）
+AUDIT_DIRECTORY_NAME = "audit"           # 审计一律落 <work_dir>/audit/，永不落工作区根
+AUDIT_KIND_AGENT = "agent"               # 任务节点投递
+AUDIT_KIND_JUDGE = "judge"               # 判定节点投递
+AUDIT_KIND_NO_ADAPTER = "no-adapter"     # 防御分支：probe 通过却无可用适配器
+
+audit_stdout_file_name(node_id, kind, attempt) -> "<node_id>-<kind>-<attempt>.stdout.log"
+audit_stderr_file_name(node_id, kind, attempt) -> "<node_id>-<kind>-<attempt>.stderr.log"
+audit_stdout_relative_path(node_id, kind, attempt) -> Path("audit/<...>.stdout.log")
+dispatch_attempt_from_ledger_entries(ledger_entries, node_id) -> int
+
+@dataclass(frozen=True)
+class AuditArtifact:                     # 一次派发审计产物的身份
+    directory: Path; node_id: str; kind: str; attempt: int
+    def stdout_path(self) -> Path: ...
+    def stderr_path(self) -> Path: ...
+
+class AgentAdapter(Protocol):            # dispatch 签名扩展（keyword-only）
+    async def dispatch(..., *, audit_artifact: AuditArtifact | None = None) -> DispatchResult: ...
+```
+
+- **`attempt` 只能由账本重建**：执行器每次投递前先落 `agent_dispatched`，故"该节点 `agent_dispatched` 条数"恰等于本次 attempt。**写侧命名与读侧定位都用这一个数**，不依赖任何进程内状态 → 跨进程 / 恢复 / 判定重读都能精确落到同一个文件。
+- **`audit_artifact=None`** 时一律落 `work_dir/audit/`（由适配器按 `work_dir` 推导），**不会**退回工作区根。
+- **同名覆盖**：同一 attempt 重投打开同名文件（`"wb"` 截断），只留一份命名，不产生时间戳/序号副本。
+- **读侧缺文件不是错误**：`evidence_conversion._read_audit_tail(work_dir, audit_relative_path)` 在读不到时返回空串，`UpstreamNodeEvidence.audit_relative_path` 为相对工作区根的路径（旧工作区的历史审计文件**不迁移**，旧记录只会退化为空 `audit_tail`）。
+- **账本生命周期（单实例）**：`run_flow(flow_ir, workspace, hooks, ledger=None)` 传入即**借用**（内核**永不 close**），只有 `None` 时自建并自管；CLI 整轮只开一个 `EventLedger` 并关一次；判定侧的 `_JudgeLedgerRecorder(ledger)` 持同一实例且只读（单一写者纪律）。
 
 - **双信号退出监视器**在此实现：asyncio task `select` 语义——进程退出 vs 语义完成信号 vs 超时，三者竞速；语义完成先到则优雅等待进程退出（宽限期 30s），超期 kill 并记 `timed_out=False, semantic_done=True`。
 - 判定"语义完成"是**适配器私有**逻辑：claude_code 监听 stream-json 的 `result` 消息；opencode 监听事件流到 session idle。

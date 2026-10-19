@@ -138,14 +138,20 @@ class ReadonlyViewHashChainTest(unittest.TestCase):
 
 
 class JudgeLedgerRecorderReadonlyTest(unittest.TestCase):
-    """判定侧代理读取账本时不截断、不改写磁盘。"""
+    """判定侧代理读取账本时不截断、不改写磁盘。
+
+    代理不透传路径，只透传**共享账本实例**的条目；本用例用只读视图当共享实例，
+    因此读取既看不到半行垃圾（只读视图不截断但按恢复规则忽略），磁盘字节也零变化。
+    """
 
     def test_judge_ledger_recorder_entries_ignore_tail_without_mutating_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             ledger_path = Path(temp_dir) / "ledger.jsonl"
             bytes_before_open = _write_ledger_with_trailing_half_line(ledger_path, 2)
 
-            recorder = _JudgeLedgerRecorder(ledger_path)
+            shared_ledger_view = EventLedger.open_readonly(ledger_path)
+            self.addCleanup(shared_ledger_view.close)
+            recorder = _JudgeLedgerRecorder(shared_ledger_view)
             entries = recorder.entries()
             entries_again = recorder.entries()
 
@@ -174,7 +180,7 @@ class JudgeLedgerRecorderReadonlyTest(unittest.TestCase):
                     idem_key="first",
                     run_name="run-chain",
                 )
-                first_recorder = _JudgeLedgerRecorder(ledger_path)
+                first_recorder = _JudgeLedgerRecorder(writer_ledger)
                 self.assertEqual(len(first_recorder.entries()), 1)
 
                 writer_ledger.append(
@@ -184,7 +190,7 @@ class JudgeLedgerRecorderReadonlyTest(unittest.TestCase):
                     run_name="run-chain",
                 )
                 # 每次判定都会新建 recorder，因此能看到引擎新落账的条目
-                second_recorder = _JudgeLedgerRecorder(ledger_path)
+                second_recorder = _JudgeLedgerRecorder(writer_ledger)
                 self.assertEqual(len(second_recorder.entries()), 2)
             finally:
                 writer_ledger.close()

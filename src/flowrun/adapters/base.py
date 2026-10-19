@@ -29,6 +29,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from flowrun.adapters.audit_paths import (  # noqa: F401  (原样重新导出，历史导入路径不变)
+    AUDIT_DIRECTORY_NAME,
+    AUDIT_KIND_AGENT,
+    AUDIT_KIND_JUDGE,
+    AUDIT_KIND_NO_ADAPTER,
+    AUDIT_STDERR_SUFFIX,
+    AUDIT_STDOUT_SUFFIX,
+    AuditArtifact,
+    audit_artifact_stem,
+    audit_stderr_file_name,
+    audit_stdout_file_name,
+    audit_stdout_relative_path,
+    dispatch_attempt_from_ledger_entries,
+)
 from flowrun.adapters.cmd_line_safety import render_cmd_exe_arguments
 from flowrun.adapters.registry import (
     INJECTION_MODE_CONTENT,
@@ -40,13 +54,18 @@ from flowrun.adapters.registry import (
     expand_command_template,
     resolve_command_path,
 )
+from flowrun.adapters.windows_launch import (  # noqa: F401  (原样重新导出)
+    TASKKILL_TIMEOUT_SECONDS,
+    CommandHeadUnresolvableError,
+    WindowsLaunchPlan,
+    plan_windows_command_launch,
+    taskkill_process_tree,
+)
 
 DEFAULT_SEMANTIC_GRACE_SECONDS = 30.0
 # 进程死后排干管道的兜底时限：防极端场景（孤孙子进程仍握着管道写端）
 # 让 dispatch 永久挂起。超期放弃排干，保留已写入的审计内容。
 DEFAULT_PIPE_DRAIN_GRACE_SECONDS = 5.0
-# taskkill /T /F 的自限时：绝不让收尸动作本身挂住 dispatch。
-TASKKILL_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass
@@ -73,16 +92,8 @@ class AgentAdapter(Protocol):
     name: str
 
     async def dispatch(self, packet_path: Path, agent_command: list[str], work_dir: Path,
-                       timeout_seconds: float | None) -> DispatchResult: ...
-
-
-class CommandHeadUnresolvableError(FileNotFoundError):
-    """适配层错误：命令头在本机不可解析（PATH 与扩展名候选集都没命中）。
-
-    继承 ``FileNotFoundError`` 是刻意的：win32 上 CreateProcess 找不到命令时抛的
-    就是 ``FileNotFoundError: [WinError 2] 系统找不到指定的文件``，调用方现有的
-    OSError 兜底路径不用改，而消息本身变成了能看懂的一句。
-    """
+                       timeout_seconds: float | None, *,
+                       audit_artifact: "AuditArtifact | None" = None) -> DispatchResult: ...
 
 
 def resolve_injection_mode(agent_command: list[str]) -> str:
@@ -108,94 +119,14 @@ def resolve_injection_mode(agent_command: list[str]) -> str:
     return INJECTION_MODE_CONTENT
 
 
-@dataclass(frozen=True)
-class WindowsLaunchPlan:
-    """win32 启动方式：直接 exec 的 argv，或交经 cmd.exe 的整条命令行（二选一）。
-
-    批处理垫片（.cmd/.bat）只能走后者。``cmd /c <shim> <args>`` 的 argv 形态在
-    "垫片路径含空格 + 参数含空格"时会产生 4 个引号，触发 cmd.exe 的引号剥离
-    启发式：垫片根本没跑，rc=1、stdout 为空（实测）。整串形态下 CPython 的 Popen
-    生成 ``cmd.exe /c "<render_cmd_exe_arguments 结果>"``，cmd 剥掉外层引号后正好是
-    ``"<shim>" "<arg>"...``（每个 token 都已带引号）——这正是 cmd 认可的形态
-    （实测三种空格组合全部 rc=0）。
-    """
-
-    exec_arguments: tuple[str, ...] | None = None
-    shell_command_line: str | None = None
-
-    def __post_init__(self) -> None:
-        if (self.exec_arguments is None) == (self.shell_command_line is None):
-            raise ValueError(
-                "WindowsLaunchPlan 必须且只能给一个："
-                "exec_arguments 或 shell_command_line"
-            )
-
-
-def plan_windows_command_launch(command: list[str]) -> WindowsLaunchPlan:
-    """把（已展开占位符的）命令模板解析成启动方式。
-
-    npm 等包管理器安装的 CLI 是 .cmd/.bat/.ps1 垫片，CreateProcess 无法直接 exec
-    （spawn 报 WinError 2，而 which 找得到它 → probe 通过、dispatch 崩溃）：
-
-    - .cmd/.bat → 经 cmd.exe 的整条命令行（见 WindowsLaunchPlan）；
-    - .ps1 → ``powershell -NoProfile -ExecutionPolicy Bypass -File <shim>``；
-    - 其余（.exe、显式路径、非 win32）→ 原样 exec。
-
-    win32 上命令头解析不到时抛 ``CommandHeadUnresolvableError``，不让 WinError 2
-    穿透（命令原样交给 CreateProcess 只会得到同义但没人看得懂的一句）。
-    """
-    if not command:
-        return WindowsLaunchPlan(exec_arguments=())
-    resolved_path = resolve_command_path(command[0])
-    if resolved_path is None:
-        if sys.platform != "win32":
-            return WindowsLaunchPlan(exec_arguments=tuple(command))
-        raise CommandHeadUnresolvableError(
-            f"命令头 '{command[0]}' 在本机不可解析：不在 PATH 上，也没有 "
-            f"{'/'.join(WINDOWS_COMMAND_SUFFIX_CANDIDATES)} 任一扩展名的可执行文件。"
-            " 请修正 frontmatter 里的 cmd:（或先安装这个 CLI）。"
-        )
-    resolved_suffix = Path(resolved_path).suffix.lower()
-    if resolved_suffix in WINDOWS_BATCH_SHIM_SUFFIXES:
-        # 批处理垫片经 cmd.exe 执行：每个参数无条件加双引号（cmd 元字符失活），
-        # 含 %/"/\r/\n 的参数失败关闭（cmd 会展开 % 并重分词）。
-        return WindowsLaunchPlan(
-            shell_command_line=render_cmd_exe_arguments([resolved_path, *command[1:]])
-        )
-    if resolved_suffix in WINDOWS_POWERSHELL_SHIM_SUFFIXES:
-        return WindowsLaunchPlan(exec_arguments=(
-            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-            "-File", resolved_path, *command[1:],
-        ))
-    return WindowsLaunchPlan(exec_arguments=tuple(command))
-
-
-def _taskkill_process_tree(process_id: int) -> bool:
-    """``taskkill /T /F /PID``：连坐终止整棵进程树。成功返回 True。
-
-    用 stdlib subprocess 调系统 taskkill，不引入额外依赖。taskkill 缺失/超时/
-    非零退出都返回 False，交给调用方回退 ``process.kill()``。
-    """
-    try:
-        completed_process = subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(process_id)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=TASKKILL_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed_process.returncode == 0
-
-
 class StreamMonitoringAdapter:
     """双信号退出监视器基类（子类只实现 parse_line）。
 
     dispatch 职责：占位符展开 → 以 work_dir 为 cwd 拉起子进程 → stdout 行流
     解析（子类语义）→ 三信号竞速裁决 → kill/收尸 → 原始 stdout/stderr
-    全量落盘到 work_dir 审计文件。所有输入按不可信处理：packet/agent 输出
-    只进结构化解析，绝不 eval/执行（interfaces.md §7）。
+    全量落盘到审计目录（``work_dir/audit/`` 或 caller 指定的 ``AuditArtifact``）。
+    所有输入按不可信处理：packet/agent 输出只进结构化解析，绝不 eval/执行
+    （interfaces.md §7）。
     """
 
     name: str = "stream-monitoring"
@@ -214,7 +145,8 @@ class StreamMonitoringAdapter:
         return SignalUpdate()
 
     async def dispatch(self, packet_path: Path, agent_command: list[str], work_dir: Path,
-                       timeout_seconds: float | None) -> DispatchResult:
+                       timeout_seconds: float | None,
+                       *, audit_artifact: AuditArtifact | None = None) -> DispatchResult:
         # 先定注入模式（垫片 → 只给路径），再展开模板，最后解析启动方式：
         # 顺序不能反，否则正文已经躺在 cmd 的命令行里了。
         launch_plan = plan_windows_command_launch(
@@ -223,15 +155,16 @@ class StreamMonitoringAdapter:
             )
         )
         work_dir.mkdir(parents=True, exist_ok=True)
-        audit_basename = self._next_audit_basename(work_dir)
+        stdout_path, stderr_path = self._resolve_audit_paths(work_dir, audit_artifact)
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
 
         started_at = time.monotonic()
         process = await self._spawn_child_process(launch_plan, work_dir)
 
         semantic_event = asyncio.Event()
         structured_result: dict = {}
-        stdout_audit_file = (work_dir / f"{audit_basename}.stdout.log").open("wb")
-        stderr_audit_file = (work_dir / f"{audit_basename}.stderr.log").open("wb")
+        stdout_audit_file = stdout_path.open("wb")
+        stderr_audit_file = stderr_path.open("wb")
         try:
             stdout_pump_task = asyncio.create_task(
                 self._pump_stdout_lines(process, stdout_audit_file,
@@ -290,14 +223,33 @@ class StreamMonitoringAdapter:
             exit_code=exit_code,
             timed_out=timed_out,
             semantic_done=semantic_done,
-            stdout_path=work_dir / f"{audit_basename}.stdout.log",
+            stdout_path=stdout_path,
             duration_seconds=time.monotonic() - started_at,
             structured_result=structured_result,
-            stderr_path=work_dir / f"{audit_basename}.stderr.log",
+            stderr_path=stderr_path,
+        )
+
+    def _resolve_audit_paths(
+        self, work_dir: Path, audit_artifact: AuditArtifact | None
+    ) -> tuple[Path, Path]:
+        """解析本次审计落盘路径（stdout, stderr）。
+
+        - 给了 ``audit_artifact``（生产路径：任务/判定投递）：落审计目录下的规范名
+          ``<node_id>-<kind>-<attempt>.stdout.log``（写侧与读侧共用的命名真相）；
+        - 未给（适配器单测直接调用）：落 ``work_dir/audit/<name>-dispatch-<ts>-<seq>``
+          ——仍**不进工作区根**，只是没有节点身份时用进程内序号保证唯一。
+        """
+        if audit_artifact is not None:
+            return audit_artifact.stdout_path(), audit_artifact.stderr_path()
+        audit_basename = self._next_audit_basename(work_dir)
+        audit_directory = Path(work_dir) / AUDIT_DIRECTORY_NAME
+        return (
+            audit_directory / f"{audit_basename}{AUDIT_STDOUT_SUFFIX}",
+            audit_directory / f"{audit_basename}{AUDIT_STDERR_SUFFIX}",
         )
 
     def _next_audit_basename(self, work_dir: Path) -> str:
-        """审计文件基名：<name>-dispatch-<时间戳>-<序号>，保证 work_dir 内唯一。"""
+        """审计文件基名（无节点身份时的兜底）：<name>-dispatch-<时间戳>-<序号>。"""
         self._dispatch_sequence += 1
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         return f"{self.name}-dispatch-{timestamp}-{self._dispatch_sequence:04d}"
@@ -363,7 +315,7 @@ class StreamMonitoringAdapter:
         ``process.kill()``。非 Windows 保持 ``process.kill()``（子进程栈无垫片）。
         """
         if sys.platform == "win32":
-            killed_tree = await asyncio.to_thread(_taskkill_process_tree, process.pid)
+            killed_tree = await asyncio.to_thread(taskkill_process_tree, process.pid)
             if killed_tree:
                 return
         process.kill()

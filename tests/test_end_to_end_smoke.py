@@ -137,7 +137,10 @@ class EndToEndSmokeTestCase(unittest.TestCase):
 
         self.assertTrue((workspace / "packets" / "T001.packet.md").exists())
         self.assertTrue((workspace / "packets" / "D001.judge.md").exists())
-        self.assertGreaterEqual(len(list(workspace.glob("*.stdout.log"))), 3)
+        # 审计产物已归位到 workspace/audit/（不进工作区根）：tasks + 判定各一份
+        self.assertGreaterEqual(
+            len(list((workspace / "audit").glob("*.stdout.log"))), 3
+        )
 
         approve_code, _approve_out, _approve_err = self.invoke_cli(
             ["approve", "H001", "--flow", str(flow_path), "--workspace", str(workspace)]

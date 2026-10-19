@@ -38,10 +38,14 @@ class CountingFallbackAdapter(FallbackAdapter):
         self.dispatch_count = 0
         self.dispatched_packet_paths: list[Path] = []
 
-    async def dispatch(self, packet_path, agent_command, work_dir, timeout_seconds):
+    async def dispatch(self, packet_path, agent_command, work_dir, timeout_seconds,
+                       *, audit_artifact=None):
         self.dispatch_count += 1
         self.dispatched_packet_paths.append(Path(packet_path))
-        return await super().dispatch(packet_path, agent_command, work_dir, timeout_seconds)
+        return await super().dispatch(
+            packet_path, agent_command, work_dir, timeout_seconds,
+            audit_artifact=audit_artifact,
+        )
 
 
 def make_release_flow_ir() -> FlowIR:

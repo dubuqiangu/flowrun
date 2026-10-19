@@ -153,7 +153,7 @@ class DispatchThroughSpacedShimTest(unittest.TestCase):
 
     旧实现把 ``cmd /c <shim> <args>`` 交给 list2cmdline，得到 4 个引号，
     触发 cmd.exe 的引号剥离启发式（示例性实测：rc=1、stdout 为空、
-    stderr 是 "'C:\\Users\\...\\flowrun' 不是内部或外部命令"）。
+    stderr 是 "'<用户目录>\\...\\flowrun' 不是内部或外部命令"）。
     这里三条组合都覆盖：两侧含空格 / 仅垫片含空格 / 都不含空格。
     """
 

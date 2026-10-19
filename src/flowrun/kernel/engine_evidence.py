@@ -1,8 +1,9 @@
 """FlowRun 域D2 · 判定证据包与 verdict 归一化（design.md §5.2 谓词判定调用约定）。
 
 EvidencePack 是内核交给判定 hook（``EngineHooks.judge_decision``）的证据载荷：
-入边来源节点的最近一次投递结果（退出码 / 双信号 / 产物契约核对），全部从
-ledger 事件现算（重放等价），本进程内的 DispatchResult 只补充审计文件名。
+入边来源节点的最近一次投递结果（退出码 / 双信号 / 产物契约核对）与审计 stdout
+路径，全部从 ledger 事件现算（重放等价）——审计路径按 "<节点>-<类别>-<attempt>"
+命名由账本重建，跨进程 / 恢复后仍可定位同一文件。
 
 注：任务书冻结接口里 EvidencePack/JudgeVerdict 由域D1 的 kernel.judge 定义，
 本域不 import 域D1 文件（并行开发纪律），故此处定义**结构等价**的引擎侧
@@ -20,7 +21,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from flowrun.ir.schema import FlowIR, NodeSpec
+from flowrun.adapters.base import (
+    AUDIT_KIND_AGENT,
+    AUDIT_KIND_JUDGE,
+    audit_stdout_relative_path,
+    dispatch_attempt_from_ledger_entries,
+)
+from flowrun.ir.schema import NODE_KIND_DECISION, FlowIR, NodeSpec
 from flowrun.state.flow_state import FlowState
 from flowrun.state.ledger import EventLedger
 
@@ -33,6 +40,7 @@ __all__ = [
     "JudgeDispatchFacts",
     "VerdictView",
     "assemble_evidence_pack",
+    "audit_relative_path_for_node",
     "normalize_verdict",
     "extract_usage_tokens",
 ]
@@ -48,7 +56,9 @@ class UpstreamNodeEvidence:
     semantic_done: bool
     expected_outputs: list[str]
     present_outputs: list[str]
-    stdout_file_name: str | None = None  # 原始输出审计文件名（仅本进程内可见时非空）
+    # 审计 stdout 相对工作区根的路径（如 "audit/T001-agent-1.stdout.log"）；仅凭
+    # 账本重建，跨进程/恢复后仍可定位同一文件；无投递记录时为 None（读侧留空）。
+    audit_relative_path: str | None = None
 
 
 @dataclass
@@ -97,10 +107,13 @@ def assemble_evidence_pack(
     """组装判定节点的证据包：逐条入边取来源节点的投递结果与产物核对。
 
     只信任 ledger（重放等价）：退出码/双信号取来源节点最近的 agent_exited
-    事件；产物核对以 workspace 为根逐项检查 out= 契约的存在性。
-    dispatch_results（本进程内最近一次 DispatchResult）仅用于补充审计文件名。
+    事件；产物核对以 workspace 为根逐项检查 out= 契约的存在性；审计 stdout 路径
+    由账本重建（节点 + 类别 + attempt）——**跨进程/恢复后仍可定位**，不再依赖
+    进程内 DispatchResult。``dispatch_results`` 形参保留以维持调用点签名（其内容
+    已不参与证据组装）。
     """
     upstream_evidence: list[UpstreamNodeEvidence] = []
+    ledger_entries = ledger.entries()
     for edge in incoming_edges(flow_ir, decision_node.node_id):
         if edge.source_id not in flow_ir.nodes:
             continue  # 编译器已保证端点存在，防御性跳过
@@ -112,12 +125,6 @@ def assemble_evidence_pack(
             for output_path in expected_outputs
             if (workspace / output_path).exists()
         ]
-        recent_dispatch_result = dispatch_results.get(source_node.node_id)
-        stdout_file_name = (
-            recent_dispatch_result.stdout_path.name
-            if recent_dispatch_result is not None
-            else None
-        )
         upstream_evidence.append(
             UpstreamNodeEvidence(
                 node_id=source_node.node_id,
@@ -126,10 +133,25 @@ def assemble_evidence_pack(
                 semantic_done=bool(exit_payload.get("semantic_done")),
                 expected_outputs=expected_outputs,
                 present_outputs=present_outputs,
-                stdout_file_name=stdout_file_name,
+                audit_relative_path=audit_relative_path_for_node(source_node, ledger_entries),
             )
         )
     return EvidencePack(decision_node_id=decision_node.node_id, upstream_evidence=upstream_evidence)
+
+
+def audit_relative_path_for_node(node: NodeSpec, ledger_entries: list) -> str | None:
+    """该节点最近一次派发审计 stdout 相对工作区根的路径（**仅凭账本重建**）。
+
+    命名与写侧共用 ``adapters.base`` 的单一命名函数；attempt = 该节点
+    ``agent_dispatched`` 条数（执行器每次投递前先落该事件）；类别由节点 kind 决定
+    （decision → judge，其余 → agent）。无投递记录 → None（读侧据此留空 audit_tail，
+    不报错、不崩）。
+    """
+    attempt = dispatch_attempt_from_ledger_entries(ledger_entries, node.node_id)
+    if attempt <= 0:
+        return None
+    kind = AUDIT_KIND_JUDGE if node.kind == NODE_KIND_DECISION else AUDIT_KIND_AGENT
+    return audit_stdout_relative_path(node.node_id, kind, attempt).as_posix()
 
 
 def normalize_verdict(verdict: object) -> VerdictView:

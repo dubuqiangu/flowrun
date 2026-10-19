@@ -226,38 +226,33 @@ def _handle_run(parsed_args: argparse.Namespace) -> int:
     # 不落用户标记、不生成 AGENTS.stub.md、不建 packets/audit/snapshots。
     # 校验逻辑唯一真相在 kernel.engine.verify_workspace_matches_flow（零写入纯查询）；
     # 空账本 = 全新工作区，天然通过，故 run 仍可直接冷启动新工作区（不退 5）。
-    prepare_ledger, prepare_state = open_workspace_state(workspace)
+    #
+    # 账本单实例：本次 run 全程只开这一个 EventLedger，依次喂 build_engine_hooks /
+    # run_flow（借用，绝不由内核 close）/ write_todo / print_state_summary，
+    # 最后一次 close（进程内不再出现第二个指向 ledger.jsonl 的写者）。
+    ledger, flow_state = open_workspace_state(workspace)
     try:
-        verify_workspace_matches_flow(flow_ir, prepare_ledger)
+        verify_workspace_matches_flow(flow_ir, ledger)
         workspace.mkdir(parents=True, exist_ok=True)
         # 上轮等待点留在 todo.md 的勾选/@pause/@skip/@resume 先落账，再驱动内核
-        apply_user_marks(flow_ir, workspace / "todo.md", prepare_ledger, prepare_state)
-    finally:
-        prepare_ledger.close()
+        apply_user_marks(flow_ir, workspace / "todo.md", ledger, flow_state)
 
-    generate_agents_stub(flow_ir, workspace)
-    hooks_ledger = EventLedger(workspace / "ledger.jsonl")
-    try:
+        generate_agents_stub(flow_ir, workspace)
         engine_hooks = build_engine_hooks(
-            flow_ir, workspace, hooks_ledger, parsed_args.dispatch_timeout
+            flow_ir, workspace, ledger, parsed_args.dispatch_timeout
         )
-        final_state = asyncio.run(run_flow(flow_ir, workspace, engine_hooks))
-    finally:
-        hooks_ledger.close()
-
-    # 内核写 todo 拿不到闸 payload：用重开的账本补写 PAUSED 头注释；同一句柄顺带
-    # 喂给摘要读 node_failed payload（T020j），读完即关，不额外开合账本。
-    todo_ledger, todo_state = open_workspace_state(workspace)
-    try:
-        write_todo(flow_ir, todo_state, workspace / "todo.md", todo_ledger)
+        final_state = asyncio.run(run_flow(flow_ir, workspace, engine_hooks, ledger))
+        # 内核收口时写的 todo 拿不到闸 payload：用同一账本重写一次补 PAUSED 头注释；
+        # 同一句柄顺带喂给摘要读 node_failed payload（T020j），读完即关。
+        write_todo(flow_ir, final_state, workspace / "todo.md", ledger)
         print_state_summary(
             flow_ir,
             final_state,
             title=f"flowrun run: {flow_ir.run_name}",
-            ledger=todo_ledger,
+            ledger=ledger,
         )
     finally:
-        todo_ledger.close()
+        ledger.close()
     if final_state.is_done():
         return EXIT_FLOW_DONE
     if final_state.is_halted():

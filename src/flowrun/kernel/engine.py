@@ -118,11 +118,19 @@ class EngineHooks:
     snapshot: Callable[[EventLedger, FlowState], object] | None = None
 
 
-async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> FlowState:
+async def run_flow(
+    flow_ir: FlowIR,
+    workspace: Path,
+    run_hooks: EngineHooks,
+    ledger: EventLedger | None = None,
+) -> FlowState:
     """驱动流程到等待点或完成，返回收口时的 FlowState（已写 todo 投影）。
 
-    workspace 布局：ledger.jsonl / snapshots/ / todo.md / packets/ / audit/
-    （EventLedger 与 SnapshotStore 在本函数内部构造）。
+    workspace 布局：ledger.jsonl / snapshots/ / todo.md / packets/ / audit/。
+
+    账本单实例约定：``ledger`` 传入则**借用**——全程只用该实例追加、**绝不 close**
+    （由调用方负责生命周期）；为 None 才自建自管（构造并在收口/异常时关闭），
+    保持默认行为与既有调用点零变化。
     """
     workspace = Path(workspace)
     packet_dir = workspace / "packets"
@@ -130,7 +138,9 @@ async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> 
     snapshots_dir = workspace / "snapshots"
     for required_dir in (packet_dir, audit_dir, snapshots_dir):
         required_dir.mkdir(parents=True, exist_ok=True)
-    ledger = EventLedger(workspace / "ledger.jsonl")
+    owns_ledger = ledger is None
+    if owns_ledger:
+        ledger = EventLedger(workspace / "ledger.jsonl")
     try:
         snapshot_store = SnapshotStore(snapshots_dir)
         snapshot_action = run_hooks.snapshot or snapshot_store.maybe_snapshot
@@ -141,7 +151,8 @@ async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> 
         def finish() -> FlowState:
             final_state = recover_flow_state(ledger, snapshot_store)
             write_todo(flow_ir, final_state, todo_path)
-            ledger.close()  # 关闭追加句柄（幂等）；读路径不受影响，Windows 下防文件锁
+            if owns_ledger:
+                ledger.close()  # 关闭追加句柄（幂等）；借用账本绝不关闭
             return final_state
 
         verify_workspace_matches_flow(flow_ir, ledger)
@@ -237,10 +248,12 @@ async def run_flow(flow_ir: FlowIR, workspace: Path, run_hooks: EngineHooks) -> 
         # 任何路径（正常 finish / 身份校验失败 / 主循环异常）都释放追加句柄，
         # 否则 Windows 下账本文件被占用，os.replace / 删除都会失败。
         # close() 幂等（finish 已关过则无操作），失败也不掩盖原始异常。
-        try:
-            ledger.close()
-        except OSError:
-            pass
+        # 借用账本（owns_ledger=False）绝不关闭——生命周期归调用方。
+        if owns_ledger:
+            try:
+                ledger.close()
+            except OSError:
+                pass
 
 
 def verify_workspace_matches_flow(flow_ir: FlowIR, ledger: EventLedger) -> None:
