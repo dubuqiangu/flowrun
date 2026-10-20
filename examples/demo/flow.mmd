@@ -1,0 +1,15 @@
+---
+run: demo-release
+defaults: {agent: demo-worker, budget_tokens: 200000}
+agents:
+  demo-worker: {cmd: "__DEMO_WORKER_CMD__"}
+  demo-judge: {cmd: "__DEMO_JUDGE_CMD__"}
+---
+flowchart TD
+  T001[写登录 API;;agent=demo-worker;;out=src/auth.py,tests/test_auth.py] --> J001
+  T002[写登录 UI;;agent=demo-worker;;out=src/ui/Login.jsx] --> J001
+  J001[集成准备] -->|when: all| D001{验收通过?;;agent=demo-judge}
+  D001 -->|when: ok| H001([发布人审])
+  D001 -->|when: fail| T003[失败诊断;;agent=demo-worker;;out=diagnosis.md]
+  D001 -->|timeout: 30m| T005[超时诊断;;agent=demo-worker;;out=timeout-report.md]
+  H001 --> T004[打 tag 发布;;agent=demo-worker;;out=release-tag.txt]
