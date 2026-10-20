@@ -52,6 +52,15 @@ flowrun todo --workspace ws --flow flow.mmd # 重写 todo.md 投影(勾选回写
 
 退出码:`0` 完成 / `1` 等待(人审或暂停) / `2` 终止(M1 保留位,无生产者,见 tasks.md 台账) / `3` 编译或校验错误 / `4` 工作区身份不符 / `5` 工作区未初始化 / `6` 账本损坏(中段不可解析 / 哈希链断裂 / 快照核对失败 / 快照记录形状非法)。退出码 `6` 由 CLI 入口统一捕获,stderr 输出含 `ledger.jsonl` 路径与原因的可读诊断,**不打 Python traceback**。
 
+想先看效果再动手?仓库里有一个**可直接运行**的样例(确定性假 agent,不联网):
+
+```sh
+python examples/demo/run_demo.py           # 七步剧本 + 自动断言 + 验收表
+python examples/demo/run_demo.py --keep    # 保留工作区,自己翻账本与审计文件
+```
+
+它跑通"并行派发 → join → 判定分叉 → 人审挂起 → 收口",并演示三条失败路径(缺少产物 / 判定回不存在的边 / agent 进程失败)。细节见 [examples/demo/README.md](examples/demo/README.md)。
+
 ## 功能一览
 
 | 功能 | 入口 | 说明 |
