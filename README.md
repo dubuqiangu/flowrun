@@ -15,7 +15,9 @@ T002[实现登录UI]  ─┴→ J001[集成准备] → D001{验收通过?}
 - **闸与恢复闭环**:hop / 预算 / 非法边触发转人审,`flowrun resume` 或 todo 行尾 HTML 注释 `<!-- @resume -->` 恢复;hop 与 budget **各自独立判定**,同一轮可同时命中并各落 `gate_tripped`,一个闸被豁免不连坐另一个闸(按闸名分别"至多一次 + 其后有 `flow_resumed` 即永久豁免")
 - **工作区身份**:以账本 `flow_started` 为身份真相源,其 `planned_nodes` 与当前图节点集**严格集合相等**(多一个或少一个都拒,"换图请换工作区"),不符退 `4`;校验**零写入**且在一切写入之前执行,`run` 与 `resume` 同一套
 - **失败可审计**:失败节点停在可审计位置,`out=` 产物逐项核对,退出码与语义信号双通道完成判定
-- **注入安全**:agent 命令头是 Windows `.cmd/.bat/.ps1` 垫片时自动切换为路径注入(packet 正文绝不进命令行,防 `cmd.exe` 重分词注入);`.cmd/.bat` 经 `subprocess.list2cmdline` 生成整条命令行交 cmd.exe,`.ps1` 经 `powershell -NoProfile -ExecutionPolicy Bypass -File` 启动;垫片型 agent 用 `--file __FLOW_PACKET_PATH__` 显式取件
+- **注入安全**:agent 命令头是 Windows `.cmd/.bat/.ps1` 垫片时自动切换为路径注入(packet 正文绝不进命令行,防 `cmd.exe` 重分词注入);`.cmd/.bat` 经 `adapters/cmd_line_safety.py::render_cmd_exe_arguments` 逐参数加引号生成整条命令行交 cmd.exe(含 `%`/`"`/换行的参数直接拒绝执行),`.ps1` 经 `powershell -NoProfile -ExecutionPolicy Bypass -File` 启动;垫片型 agent 用 `--file __FLOW_PACKET_PATH__` 显式取件
+- **审计产物归位**:agent stdout/stderr 一律落 `workspace/audit/`,名 `<node_id>-<kind>-<attempt>.stdout.log`(`.stderr.log` 配对),`attempt` 由账本 `agent_dispatched` 条数重建——名字可推导、跨进程可定位;判定证据里的 `audit_tail` 读同一规范路径
+- **账本单实例**:整轮 `run` 只开一个 `EventLedger`;`run_flow` 传入账本时是**借用**(不关闭),只有未传时才自建并自管;判定只持有共享只读视图
 
 ## 快速开始
 
