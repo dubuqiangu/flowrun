@@ -291,7 +291,7 @@
 - [x] **T020j 失败归因写进 payload（✅ 第七轮已修）**：`node_failed` 不再只写通用 reason——现写 `{exit_code, timed_out, reason}`，`reason ∈ {timed_out, nonzero_exit, missing_outputs, dispatch_exception, agent_unavailable, interrupted_by_restart}` 或 judge 异常串；`run`/`status` 概览直接打印 `失败: <node>（exit_code=… reason=… timed_out=…）`，不必再反推邻接事件。
 - [x] **T020k join 前驱不可达需提示（✅ 第七轮已修，口径＝展示层诊断）**：`kernel/state_summary.py::describe_join_blocking` 区分「join 等待 …（正常推进中）」与「join 阻塞 … 已 failed，永远不会到达」。**这是展示诊断，不落事件、不设闸**，流程仍停在等待点等人工——刻意不与 design §5.3 的闸语义混用。
 - [x] **T020l verdict.edge 口径统一（✅ 第七轮已落地）**：统一为**命中边在 `flow_ir.edges` 中的声明序号**（与 `edge_taken` 幂等键 `index` 同口径，复用 `_edge_position_in_flow` 保证不漂移）；tripped / 未命中记 `null`。**跨版本不兼容**（`edge` 由字符串＝目标节点名 → 整数）：但投影层不读该字段 → 重放 / 续跑 / 幂等 / 工作区身份**零变化**，**无需换新工作区**，只在升级说明写一句口径变更即可。design.md §4.4 / §5.2 已同步。
-- [ ] **T020m 审计文件名去实例耦合（✅ 第八轮已闭合，随 T020b 一起落地）**：审计文件名不再含进程/实例信息，改由「节点 + 类别 + 账本 attempt」唯一确定，跨 run、跨进程可精确重建（同一 attempt 重投覆盖同名文件，不产生第二种命名）。
+- [x] **T020m 审计文件名去实例耦合（✅ 第八轮已闭合，随 T020b 一起落地）**：审计文件名不再含进程/实例信息，改由「节点 + 类别 + 账本 attempt」唯一确定，跨 run、跨进程可精确重建（同一 attempt 重投覆盖同名文件，不产生第二种命名）。命名唯一真相为 `adapters/audit_paths.py`（纯函数：`audit_artifact_stem` / `audit_stdout_file_name` / `audit_stderr_file_name` / `audit_stdout_relative_path` / `dispatch_attempt_from_ledger_entries`，整套实现不含任何 pid 或进程标识），写侧与读侧共用同一组函数，验收见 `tests/test_audit_artifact_layout.py`（289 行）。
 
 ### M1 审计/账本平面批次（第八轮，2026-10-19，已完成）
 
@@ -345,7 +345,16 @@
 - [ ] **T025 Gemini CLI 适配器**：验证 headless 面的长尾（退出码 42/53 语义化利用）。
   - 验收：三家中最弱信号源下判定器仍可靠。
 - [ ] **T026 subgraph 子流程语义评估**：是否升级为可执行单元（带结论的评估文档即可）。
-- [ ] **T027 发布准备**：定名（查重名/商标）、README、许可协议（倾向 Apache-2.0）。
+- **[部分完成] T027 发布准备**：
+  - [x] **定名**：`flowrun`（`pyproject.toml` `name = "flowrun"`，版本 `0.1.0`；仓库名同）。
+  - [x] **README**：已成型（快速开始 / 功能一览 / todo 指令标记 / 监控面 / 样例入口）。
+  - [x] **许可协议**：**MIT**（`LICENSE` + `pyproject.toml` `license = "MIT"`，版权行 `Copyright (c) 2026 dubuqiangu`）。原计划倾向于 Apache-2.0，实际落地为 MIT——MIT 更短、更接纳下游任意复用，与"只做流程控制、不绑定生态"的定位一致。
+  - [ ] **重名 / 商标查重（2026-10-21 已完成公开渠道检索，结论见下）**：
+    - **PyPI：已被他占**。`flowrun` 存在于 PyPI，作者 `pskishere`，最新 `0.2.0`（2021-01-02），历史 11 个版本。`pip install flowrun` 会装到别人那个包 → **本项目不能直接以 `flowrun` 之名上 PyPI**。
+    - **npm：未占**。`registry.npmjs.org/flowrun` 返回 `404 Not Found`。
+    - **GitHub：85 个仓库含 `flowrun`，其中同名或近同名 4 个**：`sacode387/FlowRun`（Scala，59★，"Runnable flowcharts for the web"，2026-10-18 仍在推）、`dnan04/FlowRun`（Python，1★，"自助跑数平台"）、`yametech/flowrun`（Python，1★，FSM echoer SDK）、**`runboktu/FlowRun`（Rust，1★，"Production-grade orchestration engine for autonomous AI agents"，与本项目定位最接近，需重点区分）**；另有 `flowrunner` 系列（`nidyran/Flowrunner` 8★ 2026-10-20 在推、`devhelpr/flowrunner` 已归档）。
+    - **商标：未检索**。USPTO 公开检索无稳定可自动化端点（实测 `tmsearch` API 返回 `NoSuchKey`），故商标状态**存疑、未验证**——需人工在 [tmsearch.uspto.gov](https://tmsearch.uspto.gov) 与 [EUIPO](https://euipo.europa.eu) 检索 `flowrun` / `flow run`，尤其 Software 类（Nice 09 / 42）。
+    - **结论与待决策**：仓库名保持 `flowrun`（用户明确要求），但**发行名必须改**——以下候选已逐个实测 PyPI JSON 端点均返回 `404`（可用，2026-10-21）：`flowrun-orchestrator`、`flowrun-mmd`、`pyflowrun-mmd`、`flowrun-cli`、`flowrun-core`。**推荐 `flowrun-mmd`**：`runboktu/FlowRun` 已自述为 "orchestration engine for autonomous AI agents"，用 `-orchestrator` 反而贴上去制造混淆；而"由 Mermaid 驱动"才是本项目的独有识别点（Mermaid 是真相源、todo 是投影）。**发行名未定，故未改 `pyproject.toml`**：改名要动发行元数据并影响 `verify-install.ps1` 的包树核对，需用户拍板后一次性完成（`import flowrun` 保持不动即可，发行名与导入名可以不同）。
 
 ---
 

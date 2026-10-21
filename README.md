@@ -26,6 +26,9 @@ pip install "git+https://github.com/dubuqiangu/flowrun.git"
 # 需要写权限(提 PR / 私有 fork)时改用 SSH: pip install "git+ssh://git@github.com/dubuqiangu/flowrun.git"
 ```
 
+> ⚠️ **不要用 `pip install flowrun`**。PyPI 上的 `flowrun` 是别人 2021 年的另一个包,
+> 与本项目无关。本项目目前**只从 GitHub 直装**;正式发布前会切换到新的发行名(见 tasks.md T027 查重结论)。
+
 写一个 `flow.mmd`(完整样例见 [examples/flow.mmd](examples/flow.mmd)):
 
 ```
