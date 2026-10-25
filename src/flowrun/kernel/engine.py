@@ -76,6 +76,15 @@ from .engine_gates import (
 from .engine_graph import first_timeout_edge
 from .engine_node_executors import advance_ready_nodes
 from .todo_projection import write_todo
+from .workspace_identity import (
+    FlowWorkspaceMismatchError,
+    verify_workspace_matches_flow,
+)
+from .workspace_layout import (
+    WorkspaceLayout,
+    layout_for_new_run,
+    layout_for_open_ledger,
+)
 
 __all__ = [
     "EngineHooks",
@@ -83,17 +92,6 @@ __all__ = [
     "run_flow",
     "verify_workspace_matches_flow",
 ]
-
-
-class FlowWorkspaceMismatchError(Exception):
-    """工作区账本的身份（run 名 / 计划节点集合）与当前流程图不符。
-
-    工作区是流程身份的载体：同一个工作区只服务同一个 run。不符意味着用户
-    拿错了工作区（如 ``flowrun run b.mmd --workspace a的工作区``），此时若
-    继续推进，恢复出的 A 状态会被当成 B 的状态——A 已 done 时 B 整图会被
-    静默跳过。故一律拒绝，由调用方（CLI）转成退出码 4。
-    """
-
 
 
 @dataclass
@@ -126,25 +124,34 @@ async def run_flow(
 ) -> FlowState:
     """驱动流程到等待点或完成，返回收口时的 FlowState（已写 todo 投影）。
 
-    workspace 布局：ledger.jsonl / snapshots/ / todo.md / packets/ / audit/。
+    workspace 布局（T022，唯一真相 ``kernel.workspace_layout``）：
+    - **legacy**：工作区根存在 ``ledger.jsonl`` → ``ledger.jsonl`` / ``snapshots/``
+      / ``todo.md`` / ``packets/`` / ``audit/`` 全部在根（既有工作区零迁移）；
+    - **namespaced**：根没有 ``ledger.jsonl`` → 本次 run 独占
+      ``<workspace>/<run_name>/``，五类运行期资产都在该子目录内，各 run 互不串扰。
+    借用账本时以账本所在目录为准（调用方可能已按子目录打开），不再二次推断。
 
     账本单实例约定：``ledger`` 传入则**借用**——全程只用该实例追加、**绝不 close**
     （由调用方负责生命周期）；为 None 才自建自管（构造并在收口/异常时关闭），
     保持默认行为与既有调用点零变化。
     """
-    workspace = Path(workspace)
-    packet_dir = workspace / "packets"
-    audit_dir = workspace / "audit"
-    snapshots_dir = workspace / "snapshots"
-    for required_dir in (packet_dir, audit_dir, snapshots_dir):
+    workspace = Path(workspace).resolve()
+    # 布局唯一真相：写入路径按**本次 run** 定（namespaced = <ws>/<run>/），不依赖
+    # "此刻根有没有账本"——否则"先建 run 目录、后落账本"的时序会把首轮误判成
+    # legacy。借用账本时以账本自身所在目录为准（调用方可能已按子目录打开）。
+    layout = _layout_for_borrowed_ledger(ledger, workspace, flow_ir.run_name)
+    packet_dir = layout.packets_dir
+    audit_dir = layout.audit_dir
+    snapshots_dir = layout.snapshots_dir
+    for required_dir in layout.required_directories():
         required_dir.mkdir(parents=True, exist_ok=True)
     owns_ledger = ledger is None
     if owns_ledger:
-        ledger = EventLedger(workspace / "ledger.jsonl")
+        ledger = EventLedger(layout.ledger_path)
     try:
         snapshot_store = SnapshotStore(snapshots_dir)
         snapshot_action = run_hooks.snapshot or snapshot_store.maybe_snapshot
-        todo_path = workspace / "todo.md"
+        todo_path = layout.todo_path
         run_name = flow_ir.run_name
         dispatch_results: dict[str, object] = {}  # 本进程内各节点最近一次 DispatchResult
 
@@ -212,7 +219,7 @@ async def run_flow(
 
             # ④ 推进 ready 节点（human_requested → 本轮挂起返回）
             if await advance_ready_nodes(
-                flow_ir, flow_state, ledger, run_hooks, workspace, dispatch_results
+                flow_ir, flow_state, ledger, run_hooks, layout.run_root, dispatch_results
             ):
                 return finish()
 
@@ -256,62 +263,23 @@ async def run_flow(
                 pass
 
 
-def verify_workspace_matches_flow(flow_ir: FlowIR, ledger: EventLedger) -> None:
-    """工作区身份校验（FIX-B3 / K2，冻结公开接口）：不符抛 ``FlowWorkspaceMismatchError``。
+def _layout_for_borrowed_ledger(
+    ledger: EventLedger | None, workspace: Path, run_name: str
+) -> WorkspaceLayout:
+    """选定本次运行的布局。
 
-    冻结接口（下一轮 cli.py 依赖）：函数名、参数顺序、抛出的异常类型都不再变更。
+    借账本 → 以账本所在目录为准（见 ``layout_for_open_ledger``）；不借 → 按
+    ``flow_ir.run_name`` 走 namespaced 布局 ``<workspace>/<run_name>/``。
 
-    零写入纯查询：只读账本，不落事件、不建目录、不改文件；可直接在**已打开的**
-    ``EventLedger`` 上调用。
-
-    校验规则（用户裁定：**严格集合相等**，fail-closed）：
-    - **空账本 = 全新工作区**，放行（首次 run 随后落 flow_started）；
-    - 账本非空但**没有 flow_started** → 拒绝：这不是内核生成的合法工作区，
-      身份无从校验——旧实现直接跳过，于是一个手工写入/陈旧账本可以绕过身份
-      校验，把**另一张图**续跑上去（fail-open 漏洞）；
-    - flow_started 的 **planned_nodes 缺失或为空** → 拒绝：无计划节点集可比，
-      身份无从校验——旧实现只认 run 名，同名的另一张图即可绕过；
-    - planned_nodes 与当前图节点集必须**双向一致**：多出一个节点、或少一个
-      节点都拒绝（"换图请换工作区"）。
-
-    两种"无法校验"的情形都退 4（``FlowWorkspaceMismatchError`` → CLI 退出码 4），
-    诊断文案给出原因与可执行建议；校验仍在一切写入之前、零写入。
+    内核的写入路径**永不现场推断"根有没有账本"**：``run_flow`` 是流程执行者，
+    它只服务 ``flow_ir.run_name`` 这一个 run，路径确定性优先于兼容启发式。
+    旧工作区的兼容由**调用方**完成（CLI 用 ``resolve_layout_for_read`` 解析后
+    以借用账本方式传入），这样"同一个旧工作区继续扁平、新工作区按 run 分包"
+    的判定只存在于一处，内核不重复判断。
     """
-    if ledger.last_seq == 0:
-        return  # 空账本 = 全新工作区：无身份可校验，放行首次 run
-    flow_started_entry = next(
-        (entry for entry in ledger.entries() if entry.type == "flow_started"), None
-    )
-    if flow_started_entry is None:
-        raise FlowWorkspaceMismatchError(
-            "账本非空但缺少 flow_started 事件，无法校验工作区身份"
-            "（这不是内核生成的合法工作区）；请换新工作区"
-        )
-    recorded_run_name = flow_started_entry.run
-    if recorded_run_name != flow_ir.run_name:
-        raise FlowWorkspaceMismatchError(
-            f"工作区属于 run '{recorded_run_name}'，与 '{flow_ir.run_name}' 不匹配"
-            "（工作区不可跨流程复用：换图请换工作区）"
-        )
-    recorded_planned_nodes = set(flow_started_entry.payload.get("planned_nodes") or [])
-    if not recorded_planned_nodes:
-        raise FlowWorkspaceMismatchError(
-            "账本 flow_started 缺少 planned_nodes（计划节点集为空），无法校验工作区身份；"
-            "请换新工作区"
-        )
-    current_node_ids = set(flow_ir.nodes)
-    replaced_node_ids = recorded_planned_nodes - current_node_ids
-    if replaced_node_ids:
-        raise FlowWorkspaceMismatchError(
-            f"工作区已有节点 {sorted(replaced_node_ids)} 不在当前图中——图已被替换"
-            "（工作区不可跨流程复用：换图请换工作区）"
-        )
-    appended_node_ids = current_node_ids - recorded_planned_nodes
-    if appended_node_ids:
-        raise FlowWorkspaceMismatchError(
-            f"当前图新增节点 {sorted(appended_node_ids)} 不在该工作区计划中"
-            "——追加节点请换工作区（工作区不可跨流程复用）"
-        )
+    if ledger is None:
+        return layout_for_new_run(workspace, run_name)
+    return layout_for_open_ledger(ledger.ledger_path, workspace, run_name)
 
 
 def _has_pending_work(flow_ir: FlowIR, flow_state: FlowState) -> bool:

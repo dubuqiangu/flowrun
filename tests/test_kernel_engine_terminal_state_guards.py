@@ -43,7 +43,7 @@ class KernelEngineTerminalStateGuardsTestCase(KernelGatesHarnessTestCase):
                 support.make_edge("X001", "Y001"),
             ],
         )
-        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         seeded_ledger.append(
             "flow_started",
             {"entry_nodes": ["A001"], "planned_nodes": ["A001", "M001", "X001", "Y001"]},
@@ -142,7 +142,7 @@ class KernelEngineTerminalStateGuardsTestCase(KernelGatesHarnessTestCase):
             [flaky_task, downstream_task],
             [support.make_edge("T001", "T002", retry=2)],
         )
-        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         seeded_ledger.append(
             "flow_started",
             {"entry_nodes": ["T001"], "planned_nodes": ["T001", "T002"]},
@@ -174,7 +174,7 @@ class KernelEngineTerminalStateGuardsTestCase(KernelGatesHarnessTestCase):
             [slow_task, fallback_task],
             [support.make_edge("T001", "T002", timeout_seconds=60.0)],
         )
-        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         seeded_ledger.append(
             "flow_started",
             {"entry_nodes": ["T001"], "planned_nodes": ["T001", "T002"]},
@@ -216,8 +216,8 @@ class KernelEngineTerminalStateGuardsTestCase(KernelGatesHarnessTestCase):
             "T001", label="非零退出但已报完成", outputs=["report/out.txt"]
         )
         flow_ir = support.make_flow_ir([task_node], [])
-        (self.workspace / "report").mkdir(parents=True, exist_ok=True)
-        (self.workspace / "report/out.txt").write_text("done", encoding="utf-8")
+        (self.run_dir() / "report").mkdir(parents=True, exist_ok=True)
+        (self.run_dir() / "report/out.txt").write_text("done", encoding="utf-8")
         self.stubs.script_dispatch_result(
             "T001", support.make_dispatch_result(exit_code=1, semantic_done=True)
         )

@@ -29,11 +29,17 @@ for path_entry in (str(SOURCE_ROOT), str(TESTS_DIRECTORY)):
         sys.path.insert(0, path_entry)
 
 from flowrun.cli import main as cli_main  # noqa: E402
+from flowrun.kernel.workspace_layout import resolve_workspace_layout  # noqa: E402
 from flowrun.state.flow_state import STATUS_DONE  # noqa: E402
 from flowrun.state.ledger import EventLedger  # noqa: E402
 
 FIXTURES_DIRECTORY = TESTS_DIRECTORY / "fixtures"
 PYTHON_EXECUTABLE_POSIX = Path(sys.executable).as_posix()
+
+
+def run_dir_of(workspace: Path, run_name: str) -> Path:
+    """该 run 的实际目录（T022：根有账本=legacy 扁平，否则 <ws>/<run>/）。"""
+    return resolve_workspace_layout(workspace, run_name).run_root
 
 SMOKE_FLOW_BODY_LINES = [
     "  T001[实现登录API;;agent=fake-task;;out=src/auth.py] --> J001",
@@ -111,8 +117,8 @@ class EndToEndSmokeTestCase(unittest.TestCase):
             exit_code = cli_main(argv)
         return exit_code, stdout_capture.getvalue(), stderr_capture.getvalue()
 
-    def read_todo_text(self, workspace: Path) -> str:
-        return (workspace / "todo.md").read_text(encoding="utf-8")
+    def read_todo_text(self, workspace: Path, run_name: str) -> str:
+        return (run_dir_of(workspace, run_name) / "todo.md").read_text(encoding="utf-8")
 
     # ---------------------------------------------------------------- 主剧本
 
@@ -127,7 +133,8 @@ class EndToEndSmokeTestCase(unittest.TestCase):
         self.assertEqual(first_code, 1, "人审等待点应退出码 1")
         self.assertIn("H001 [human] awaiting_human", first_stdout)
 
-        todo_text = self.read_todo_text(workspace)
+        run_dir = run_dir_of(workspace, "smoke-release")
+        todo_text = self.read_todo_text(workspace, "smoke-release")
         self.assertIn("- [x] T001 实现登录API", todo_text)
         self.assertIn("- [x] T002 实现登录UI", todo_text)
         h001_line = next(
@@ -135,11 +142,11 @@ class EndToEndSmokeTestCase(unittest.TestCase):
         )
         self.assertIn("awaiting_human", h001_line)
 
-        self.assertTrue((workspace / "packets" / "T001.packet.md").exists())
-        self.assertTrue((workspace / "packets" / "D001.judge.md").exists())
-        # 审计产物已归位到 workspace/audit/（不进工作区根）：tasks + 判定各一份
+        self.assertTrue((run_dir / "packets" / "T001.packet.md").exists())
+        self.assertTrue((run_dir / "packets" / "D001.judge.md").exists())
+        # 审计产物已归位到 run 目录的 audit/（不进工作区根）：tasks + 判定各一份
         self.assertGreaterEqual(
-            len(list((workspace / "audit").glob("*.stdout.log"))), 3
+            len(list((run_dir / "audit").glob("*.stdout.log"))), 3
         )
 
         approve_code, _approve_out, _approve_err = self.invoke_cli(
@@ -153,7 +160,7 @@ class EndToEndSmokeTestCase(unittest.TestCase):
         self.assertEqual(resume_code, 0, "人审通过后续跑应 flow_done")
         self.assertIn("flow: done", resume_stdout)
 
-        reopened_ledger = EventLedger(workspace / "ledger.jsonl")
+        reopened_ledger = EventLedger(run_dir / "ledger.jsonl")
         self.assertTrue(reopened_ledger.verify_chain())
         replayed_state = reopened_ledger.replay()
         for node_id in ("T001", "T002", "J001", "D001", "H001", "T004"):
@@ -174,7 +181,7 @@ class EndToEndSmokeTestCase(unittest.TestCase):
             verdict_entries[0].payload["edge"], 3, "判定应命中 ok 边（D001->H001 的声明序号）"
         )
 
-        final_todo_text = self.read_todo_text(workspace)
+        final_todo_text = self.read_todo_text(workspace, "smoke-release")
         self.assertIn("- [x] H001 发布人审", final_todo_text)
         self.assertIn("- [x] T004 打 tag 发布", final_todo_text)
         self.assertIn("- [ ] T003 失败诊断", final_todo_text)
@@ -185,16 +192,20 @@ class EndToEndSmokeTestCase(unittest.TestCase):
         workspace = self.make_workspace()
         self.invoke_cli(["run", str(flow_path), "--workspace", str(workspace)])
 
-        todo_path = workspace / "todo.md"
+        todo_path = run_dir_of(workspace, "smoke-resume-checkbox") / "todo.md"
         todo_path.write_text(
-            self.read_todo_text(workspace).replace("- [ ] H001", "- [x] H001"),
+            self.read_todo_text(workspace, "smoke-resume-checkbox").replace(
+                "- [ ] H001", "- [x] H001"
+            ),
             encoding="utf-8",
         )
         resume_code, _resume_out, _resume_err = self.invoke_cli(
             ["run", str(flow_path), "--workspace", str(workspace)]
         )
         self.assertEqual(resume_code, 0)
-        replayed_state = EventLedger(workspace / "ledger.jsonl").replay()
+        replayed_state = EventLedger(
+            run_dir_of(workspace, "smoke-resume-checkbox") / "ledger.jsonl"
+        ).replay()
         self.assertTrue(replayed_state.is_done())
         self.assertEqual(replayed_state.node_status("T004"), STATUS_DONE)
 
@@ -204,9 +215,9 @@ class EndToEndSmokeTestCase(unittest.TestCase):
         workspace = self.make_workspace()
         self.invoke_cli(["run", str(flow_path), "--workspace", str(workspace)])
 
-        judge_packet_text = (workspace / "packets" / "D001.judge.md").read_text(
-            encoding="utf-8"
-        )
+        judge_packet_text = (
+            run_dir_of(workspace, "smoke-evidence") / "packets" / "D001.judge.md"
+        ).read_text(encoding="utf-8")
         self.assertIn("T001:src/auth.py", judge_packet_text)
         self.assertIn("T002:src/ui/Login.tsx", judge_packet_text)
         self.assertIn("存在", judge_packet_text)
@@ -230,7 +241,7 @@ class EndToEndSmokeTestCase(unittest.TestCase):
             )[0],
             0,
         )
-        snapshots_directory = interrupted_workspace / "snapshots"
+        snapshots_directory = run_dir_of(interrupted_workspace, "smoke-crash") / "snapshots"
         if snapshots_directory.exists():
             for snapshot_file in snapshots_directory.iterdir():
                 snapshot_file.unlink()
@@ -248,8 +259,12 @@ class EndToEndSmokeTestCase(unittest.TestCase):
             self.invoke_cli(["run", str(flow_path), "--workspace", str(straight_workspace)])[0], 0
         )
 
-        straight_ledger = EventLedger(straight_workspace / "ledger.jsonl")
-        interrupted_ledger = EventLedger(interrupted_workspace / "ledger.jsonl")
+        straight_ledger = EventLedger(
+            run_dir_of(straight_workspace, "smoke-crash") / "ledger.jsonl"
+        )
+        interrupted_ledger = EventLedger(
+            run_dir_of(interrupted_workspace, "smoke-crash") / "ledger.jsonl"
+        )
         self.assertTrue(straight_ledger.verify_chain())
         self.assertTrue(interrupted_ledger.verify_chain())
         self.assertEqual(straight_ledger.last_seq, interrupted_ledger.last_seq)
@@ -273,7 +288,9 @@ class EndToEndSmokeTestCase(unittest.TestCase):
         )
         self.assertEqual(exit_code, 1, "失败注入应停在等待点而非崩溃")
 
-        reopened_ledger = EventLedger(workspace / "ledger.jsonl")
+        reopened_ledger = EventLedger(
+            run_dir_of(workspace, "smoke-fail-injection") / "ledger.jsonl"
+        )
         self.assertTrue(reopened_ledger.verify_chain())
         node_failed_entries = [
             entry
@@ -285,7 +302,10 @@ class EndToEndSmokeTestCase(unittest.TestCase):
             entry for entry in reopened_ledger.entries() if entry.type == "gate_tripped"
         ]
         self.assertTrue(gate_tripped_entries, "无重试边的失败应触发闸转人审")
-        self.assertFalse((workspace / "src/auth.py").exists(), "失败 agent 不应交付产物")
+        self.assertFalse(
+            (run_dir_of(workspace, "smoke-fail-injection") / "src/auth.py").exists(),
+            "失败 agent 不应交付产物",
+        )
 
         status_code, status_stdout, _status_err = self.invoke_cli(
             ["status", "--workspace", str(workspace), "--flow", str(flow_path)]
@@ -293,7 +313,7 @@ class EndToEndSmokeTestCase(unittest.TestCase):
         self.assertEqual(status_code, 0)
         self.assertIn("T001 [task] failed", status_stdout)
         self.assertIn("已触发闸", status_stdout)
-        todo_text = self.read_todo_text(workspace)
+        todo_text = self.read_todo_text(workspace, "smoke-fail-injection")
         self.assertIn("T001 实现登录API", todo_text)
         self.assertIn("FLOW PAUSED", todo_text, "FIX-C4：暂停态 todo 必须标注 PAUSED")
         self.assertIn("gate=retry", todo_text)

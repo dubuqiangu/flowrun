@@ -74,6 +74,10 @@ class JudgeUsageEngineAccountingTestCase(unittest.TestCase):
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = kernel_support.KernelHookStubs()
 
+    def run_dir(self) -> Path:
+        """本次测试 run 的实际目录（T022：namespaced 布局在 <ws>/<run>/）。"""
+        return kernel_support.run_dir_for(self.workspace, kernel_support.DEFAULT_RUN_NAME)
+
     def make_decision_flow_ir(self, budget_tokens: int = kernel_support.DEFAULT_BUDGET_TOKENS):
         upstream_task = kernel_support.make_node("T001")
         decision_node = kernel_support.make_node("D001", kind=NODE_KIND_DECISION, label="验收?")
@@ -103,7 +107,7 @@ class JudgeUsageEngineAccountingTestCase(unittest.TestCase):
         return asyncio.run(run_flow(flow_ir, self.workspace, hooks))
 
     def reopened_ledger(self) -> EventLedger:
-        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         self.addCleanup(ledger.close)
         return ledger
 

@@ -80,7 +80,11 @@ class CliStatusApprovalTodoTestCase(CliHarnessTestCase):
         )
         self.assertEqual(second_code, 0)
         self.assertIn("跳过", second_stdout)
-        ledger_lines = (self.workspace / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+        ledger_lines = (
+            (self.run_dir("cli-human-gate") / "ledger.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
         human_resolution_count = sum(
             1 for line in ledger_lines if '"human_resolved"' in line
         )
@@ -123,7 +127,7 @@ class CliStatusApprovalTodoTestCase(CliHarnessTestCase):
         flow_path = self.test_root / "human_gate.mmd"
         self.write_human_gate_flow(flow_path)
         self.invoke_cli(["run", str(flow_path), "--workspace", str(self.workspace)])
-        todo_path = self.workspace / "todo.md"
+        todo_path = self.run_dir("cli-human-gate") / "todo.md"
         self.assertIn("- [ ] H001", todo_path.read_text(encoding="utf-8"))
         todo_path.write_text(
             todo_path.read_text(encoding="utf-8").replace("- [ ] H001", "- [x] H001"),

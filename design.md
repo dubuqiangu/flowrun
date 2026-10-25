@@ -94,17 +94,26 @@ FlowRun 的钉子：**多 Agent 运行时**——图跨会话存活、条件边�
 
 ## 4. 用户产物文件精确规格
 
-产物全集（**无任何要求用户编写的代码/JSON/YAML 配置文件**）：
+产物按**双布局**组织（T022 多 run 隔离；判据：工作区根有无 `ledger.jsonl`）：
 
 ```
-flowrun/
-├── flow.mmd          # 流程真相（用户写）
-├── docs/             # 人读协议文档，如 interaction.mmd（sequenceDiagram，可选）
-├── todo.md           # 执行状态投影（内核写，用户有限操作）
-├── AGENTS.stub.md    # 内核生成的 AGENTS.md 桩（引导 agent 读 packet）
-├── ledger.jsonl      # 事件账本（内核写）
-└── snapshots/        # 周期快照（内核写）
+工作区（--workspace 指向的目录）
+├── flow.mmd / docs/…     # 用户产物与人读协议文档（你放哪就在哪，真相源）
+├── AGENTS.stub.md        # 内核生成的 agent 引导桩——工作区级资产，各 run 共享
+│
+├── ledger.jsonl          # ↓ 仅当根已有此文件 → legacy 旧工作区（扁平，零迁移）
+├── snapshots/  packets/  audit/  todo.md        （run 根 = 工作区根，行为与改造前逐字节一致）
+│
+└── <run_name>/           # ↑ 根没有 ledger.jsonl → namespaced 新工作区（默认）
+    ├── ledger.jsonl      # 每 run 各自一份账本（哈希链互不干扰）
+    ├── snapshots/        # 周期快照
+    ├── packets/          # 投递给 agent 的任务包
+    ├── audit/            # agent stdout/stderr 审计
+    └── todo.md           # 执行状态投影（该 run 独有）
 ```
+
+- agent 子进程的 cwd = **run 根**（legacy 即工作区根，namespaced 即 `<workspace>/<run>/`），产物因此天然按 run 隔离。
+- 判据与 `workspace_is_initialized` 同源（都看根的 `ledger.jsonl`），不会出现"初始化判定走 A、路径拼接走 B"的漂移。
 
 ### 4.1 flow.mmd 编写约定
 
@@ -276,12 +285,13 @@ planned → ready → running → judging → done | failed | awaiting_human
 
 ### 5.5 工作区身份校验（用户裁定：严格集合相等）
 
-工作区与流程的绑定**不可跨流程复用**——"换图请换工作区"。判据与边界（`kernel/engine.py::verify_workspace_matches_flow`）：
+工作区与流程的绑定**不可跨流程复用**——"换图请换工作区"。判据与边界（`kernel/workspace_identity.py`，T022 起从 `engine.py` 拆出、`engine.py` 原路径再导出）：
 
 - 以账本 `flow_started` 为**身份真相源**：其 `planned_nodes` 与当前图节点集必须**严格集合相等**，**多一个或少一个都拒绝**。
 - `planned_nodes` **缺失或为空**时降级为**只校验 run 名**（兼容老账本 / 手写夹具）；**空账本 = 全新工作区**不校验；账本非空但查不到 `flow_started`（异常账本）时不拦。
 - 该校验**零写入**：只读账本，不落事件、不建目录、不改文件；且在**任何写入之前**执行——不得先落用户标记、不得先写 `AGENTS.stub.md`、不得先建目录。
 - **`run` 与 `resume` 统一使用同一套校验**；不符 → 退出码 `4`（`FlowWorkspaceMismatchError`）。
+- **T022 说明**：多 run 共存由**布局**承载（每个 run 各自一份账本，见 §4），本校验守护的仍是"**这一份账本内**的 run 身份"。namespaced 工作区里"同工作区不同 run"拿到的是不同路径的账本，正常用法根本不经过本函数的拒绝分支——不是放宽，而是把冲突从"共享账本里 run 名不等"变成"路径根本不同"；legacy 扁平工作区仍严格拒绝（语义与 M2 逐字节一致）。
 
 ---
 
@@ -306,7 +316,7 @@ planned → ready → running → judging → done | failed | awaiting_human
 | 被 spec-kit 的"够用"淹没 | 绝不抢单 agent 规格生成；钉死多 Agent 运行时+条件边+并行+断点续跑 |
 | acpx flow run 长成通用编排 | 退让预案：定位为"ACP-only 场景下游"，FlowRun 聚焦编译器与闸门 |
 | 双信号竞速误杀长任务 | 语义完成信号优先、超时上限放宽、kill 前写 `agent_exited` 事件留审计痕迹 |
-| 审计输出散落工作区根、名字不可推导 | 审计一律落 `workspace/audit/`，名 `<node_id>-<kind>-<attempt>.stdout.log`（`.stderr.log` 配对），`attempt` 由账本 `agent_dispatched` 条数重建；写侧/读侧共用同一命名函数（interfaces.md §4 审计契约） |
+| 审计输出散落工作区根、名字不可推导 | 审计一律落 run 根的 `audit/`（legacy = `workspace/audit/`，namespaced = `workspace/<run>/audit/`），名 `<node_id>-<kind>-<attempt>.stdout.log`（`.stderr.log` 配对），`attempt` 由账本 `agent_dispatched` 条数重建；写侧/读侧共用同一命名函数（interfaces.md §4 审计契约） |
 | 账本被多个对象各自打开 | 单实例：`run_flow` 借用传入账本且永不 close，CLI 整轮一个实例，判定侧只持共享只读视图 |
 
 ---
@@ -316,4 +326,4 @@ planned → ready → running → judging → done | failed | awaiting_human
 1. `;;` 标签内 `]` 转义约定——M1 定稿（倾向禁用+编译期报错）。
 2. subgraph 是否升级为可执行子流程——M3 评估。
 3. 多用户/远端协作场景（IM 桥接审批）——超出 MVP，暂不做。
-4. 工具名 FlowRun 为工作名，发布前定夺（需查商标/生态重名）。
+4. 工具名 FlowRun：2026-10-25 商标/生态检索完成——USPTO tmsearch 与 EUIPO 对 `flowrun` / `flowrun-mmd` 精确短语检索均 0 命中（09/42 类），产品名维持 FlowRun；**PyPI 发行名定为 `flowrun-mmd`**（PyPI 的 `flowrun` 被他人占用，见 tasks.md T027 拍板）。

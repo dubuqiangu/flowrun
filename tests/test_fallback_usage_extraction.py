@@ -215,6 +215,10 @@ class FallbackUsageEngineAccountingTestCase(unittest.TestCase):
         self.addCleanup(self._temp_dir.cleanup)
         self.workspace = Path(self._temp_dir.name) / "workspace"
 
+    def run_dir(self) -> Path:
+        """本次测试 run 的实际目录（T022：namespaced 布局在 <ws>/<run>/）。"""
+        return support.run_dir_for(self.workspace, support.DEFAULT_RUN_NAME)
+
     def run_flow_with_longtail_agent(self, budget_tokens: int = support.DEFAULT_BUDGET_TOKENS):
         task_node = support.make_node("T001", label="长尾 CLI 任务")
         flow_ir = support.make_flow_ir([task_node], [], budget_tokens=budget_tokens)
@@ -222,7 +226,7 @@ class FallbackUsageEngineAccountingTestCase(unittest.TestCase):
         return asyncio.run(run_flow(flow_ir, self.workspace, stubs.build_hooks())), flow_ir
 
     def reopened_ledger(self) -> EventLedger:
-        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         self.addCleanup(ledger.close)
         return ledger
 

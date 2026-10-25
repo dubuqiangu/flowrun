@@ -38,7 +38,9 @@ class CliResumeTestCase(CliHarnessTestCase):
         self.assertIn("已恢复", resume_stdout)
 
         ledger_lines = (
-            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+            (self.run_dir("cli-gate-fail") / "ledger.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
         )
         resumed_lines = [line for line in ledger_lines if '"flow_resumed"' in line]
         self.assertEqual(len(resumed_lines), 1, "resume 只落一条 flow_resumed")
@@ -59,7 +61,7 @@ class CliResumeTestCase(CliHarnessTestCase):
         )
 
         # 用 todo 行尾注释 @pause 把流挂起（T002 此时 planned，可被暂停）
-        todo_path = self.workspace / "todo.md"
+        todo_path = self.run_dir("cli-human-gate") / "todo.md"
         todo_path.write_text(
             todo_path.read_text(encoding="utf-8").replace(
                 "- [ ] T002", "- [ ] T002 <!-- @pause -->"
@@ -106,7 +108,9 @@ class CliResumeTestCase(CliHarnessTestCase):
         )
         self.assertEqual(resume_code, 1)
         self.assertIn("未处于暂停状态", resume_err)
-        ledger_text = (self.workspace / "ledger.jsonl").read_text(encoding="utf-8")
+        ledger_text = (
+            self.run_dir("cli-human-gate") / "ledger.jsonl"
+        ).read_text(encoding="utf-8")
         self.assertNotIn("flow_resumed", ledger_text)
 
     def test_resume_refused_when_done(self) -> None:
@@ -126,11 +130,13 @@ class CliResumeTestCase(CliHarnessTestCase):
         self.assertIn("已完成", resume_err)
 
     def test_resume_workspace_identity_mismatch_exits_four(self) -> None:
-        """工作区账本 run 与图 run 不符 → 退出码 4（工作区身份不匹配）。"""
-        linear_flow = self.test_root / "linear.mmd"
-        self.write_linear_flow(linear_flow)  # run 名 cli-linear
-        self.invoke_cli(["run", str(linear_flow), "--workspace", str(self.workspace)])
+        """legacy 工作区（根有账本）账本 run 与图 run 不符 → 退出码 4（身份不匹配）。
 
+        T022 语义 1/5：namespaced 布局下同工作区不同 run 各占 ``<ws>/<run>/``，
+        根本不是同一份账本（resume 冷读会退 5 而非 4）；只有 legacy 扁平工作区
+        （根 ledger.jsonl 存在）仍共享一份账本，跨 run 复用必须拒绝。
+        """
+        self.write_workspace_flow_started_ledger("cli-linear", ["T001", "T002"])
         other_flow = self.test_root / "human_gate.mmd"
         self.write_human_gate_flow(other_flow)  # run 名 cli-human-gate
         resume_code, _resume_out, resume_err = self.invoke_cli(
@@ -231,7 +237,9 @@ class CliResumeTestCase(CliHarnessTestCase):
         self.assertIn("已恢复", stdout_text)
         self.assertIn(
             "flow_resumed",
-            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8"),
+            (self.run_dir("cli-gate-fail") / "ledger.jsonl").read_text(
+                encoding="utf-8"
+            ),
         )
 
     def test_resume_legacy_ledger_without_planned_nodes_is_rejected(self) -> None:

@@ -16,10 +16,12 @@ from cli_harness_support import CliHarnessTestCase  # noqa: E402  (负责把 src
 
 
 class CliLedgerCorruptionTestCase(CliHarnessTestCase):
-    def corrupt_workspace_ledger_by_appending_garbage(self, flow_path: Path) -> int:
+    def corrupt_workspace_ledger_by_appending_garbage(
+        self, flow_path: Path, run_name: str
+    ) -> int:
         """先跑一次真流程产出合法账本，再追加一行垃圾制造中段损坏；返回合法行数。"""
         self.invoke_cli(["run", str(flow_path), "--workspace", str(self.workspace)])
-        ledger_path = self.workspace / "ledger.jsonl"
+        ledger_path = self.run_dir(run_name) / "ledger.jsonl"
         valid_line_count = len(ledger_path.read_text(encoding="utf-8").splitlines())
         with ledger_path.open("a", encoding="utf-8") as ledger_handle:
             ledger_handle.write("{这不是一行合法的 ledger 条目\n")
@@ -36,7 +38,7 @@ class CliLedgerCorruptionTestCase(CliHarnessTestCase):
         """回归点：账本中段损坏时 run/status/todo/resume/approve 一律退 6 且无 traceback。"""
         flow_path = self.test_root / "human_gate.mmd"
         self.write_human_gate_flow(flow_path)
-        self.corrupt_workspace_ledger_by_appending_garbage(flow_path)
+        self.corrupt_workspace_ledger_by_appending_garbage(flow_path, "cli-human-gate")
         workspace_text = str(self.workspace)
         for argv in (
             ["status", "--workspace", workspace_text, "--flow", str(flow_path)],
@@ -57,10 +59,11 @@ class CliLedgerCorruptionTestCase(CliHarnessTestCase):
         flow_path = self.test_root / "linear.mmd"
         self.write_linear_flow(flow_path)
         self.invoke_cli(["run", str(flow_path), "--workspace", str(self.workspace)])
+        run_dir = self.run_dir("cli-linear")
         ledger_line_count = len(
-            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+            (run_dir / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
         )
-        snapshots_directory = self.workspace / "snapshots"
+        snapshots_directory = run_dir / "snapshots"
         snapshots_directory.mkdir(parents=True, exist_ok=True)
         (snapshots_directory / f"snapshot_{ledger_line_count:010d}.json").write_text(
             json.dumps(
@@ -75,7 +78,7 @@ class CliLedgerCorruptionTestCase(CliHarnessTestCase):
         )
 
         exit_code, _stdout_text, stderr_text = self.invoke_cli(
-            ["status", "--workspace", str(self.workspace)]
+            ["status", "--workspace", str(self.workspace), "--flow", str(flow_path)]
         )
         self.assertEqual(exit_code, 6)
         self.assertNotIn("Traceback", stderr_text)
@@ -91,10 +94,11 @@ class CliLedgerCorruptionTestCase(CliHarnessTestCase):
         flow_path = self.test_root / "linear.mmd"
         self.write_linear_flow(flow_path)
         self.invoke_cli(["run", str(flow_path), "--workspace", str(self.workspace)])
+        run_dir = self.run_dir("cli-linear")
         ledger_line_count = len(
-            (self.workspace / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+            (run_dir / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
         )
-        snapshots_directory = self.workspace / "snapshots"
+        snapshots_directory = run_dir / "snapshots"
         snapshots_directory.mkdir(parents=True, exist_ok=True)
         snapshot_path = snapshots_directory / f"snapshot_{ledger_line_count:010d}.json"
         snapshot_path.write_text(
@@ -105,7 +109,7 @@ class CliLedgerCorruptionTestCase(CliHarnessTestCase):
         )
 
         exit_code, _stdout_text, stderr_text = self.invoke_cli(
-            ["status", "--workspace", str(self.workspace)]
+            ["status", "--workspace", str(self.workspace), "--flow", str(flow_path)]
         )
         self.assertEqual(exit_code, 6)
         self.assertNotIn("Traceback", stderr_text)

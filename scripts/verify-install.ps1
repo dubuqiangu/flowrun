@@ -114,7 +114,7 @@ if ($null -ne $localHead) {
 
 # --- 5. 安装版本号与磁盘文件树镜像 ----------------------------------------------------
 if ($installOk) {
-  $installedVersion = (& $venvPython -c "import importlib.metadata as metadata; print(metadata.version('flowrun'))" 2>$null | Select-Object -First 1)
+  $installedVersion = (& $venvPython -c "import importlib.metadata as metadata; print(metadata.version('flowrun-mmd'))" 2>$null | Select-Object -First 1)
   Assert-Check "installed version matches pyproject" ($installedVersion -eq $expectedVersionValue) "installed=$installedVersion expected=$expectedVersionValue"
 
   $listCode = 'import flowrun,pathlib;root=pathlib.Path(flowrun.__file__).parent;print(chr(10).join(sorted(str(p.relative_to(root)).replace(chr(92),"/") for p in root.rglob("*.py"))))'

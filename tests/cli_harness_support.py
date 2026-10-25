@@ -18,6 +18,7 @@ for path_entry in (str(SOURCE_ROOT), str(TESTS_DIRECTORY)):
         sys.path.insert(0, path_entry)
 
 from flowrun.cli import main as cli_main  # noqa: E402
+from flowrun.kernel.workspace_layout import resolve_workspace_layout  # noqa: E402
 from flowrun.state.ledger import EventLedger  # noqa: E402
 
 FIXTURES_DIRECTORY = TESTS_DIRECTORY / "fixtures"
@@ -71,6 +72,10 @@ class CliHarnessTestCase(unittest.TestCase):
         self._temp_dir.cleanup()
 
     # ---------------------------------------------------------------- 工具
+
+    def run_dir(self, run_name: str) -> Path:
+        """该 run 的实际目录（T022：根有账本=legacy 扁平，否则 <ws>/<run>/）。"""
+        return resolve_workspace_layout(self.workspace, run_name).run_root
 
     def write_linear_flow(self, flow_path: Path) -> None:
         """两任务直线流（无人审）：一次 run 应直接 flow_done。"""

@@ -57,6 +57,7 @@ from .engine_gates import (
     count_node_events,
     trip_gate,
 )
+from .workspace_layout import PACKETS_DIRECTORY_NAME
 from .engine_graph import (
     first_dispatch_timeout,
     outgoing_edges,
@@ -124,7 +125,7 @@ async def execute_decision(
     try:
         verdict = run_hooks.judge_decision(
             flow_ir, decision_node, evidence_pack,
-            workspace, workspace / "packets", judge_timeout_seconds,
+            workspace, workspace / PACKETS_DIRECTORY_NAME, judge_timeout_seconds,
         )
         if inspect.isawaitable(verdict):
             verdict = await verdict

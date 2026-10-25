@@ -39,12 +39,16 @@ class KernelEngineTestCase(unittest.TestCase):
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = support.KernelHookStubs()
 
+    def run_dir(self) -> Path:
+        """本次测试 run 的实际目录（T022：namespaced 布局在 <ws>/<run>/）。"""
+        return support.run_dir_for(self.workspace, support.DEFAULT_RUN_NAME)
+
     def run_flow_once(self, flow_ir) -> object:
         return asyncio.run(run_flow(flow_ir, self.workspace, self.stubs.build_hooks()))
 
     def reopened_ledger(self) -> EventLedger:
         """重开账本读取落账结果；注册清理，避免测试结束后遗留写句柄（ResourceWarning）。"""
-        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         self.addCleanup(ledger.close)
         return ledger
 
@@ -65,7 +69,7 @@ class KernelEngineTestCase(unittest.TestCase):
             run_flow(flow_ir, self.workspace, subprocess_stubs.build_hooks())
         )
         self.assertTrue(final_state.is_done())
-        self.assertTrue((self.workspace / "src/auth.py").exists())
+        self.assertTrue((self.run_dir() / "src/auth.py").exists())
         self.assertEqual(final_state.node_status("T002"), "done")
         self.assertEqual(final_state.token_spent(), 600,
                          "两次投递各 300 usage，均应进 payload.tokens 累计")
@@ -229,9 +233,9 @@ class KernelEngineTestCase(unittest.TestCase):
         self.assertIn("T001", [call[0] for call in self.stubs.dispatch_calls])
         self.assertNotIn("H001", [call[0] for call in self.stubs.dispatch_calls],
                          "人审节点不得投递给 agent")
-        self.assertTrue((self.workspace / "todo.md").exists(), "挂起时应写 todo 投影")
+        self.assertTrue((self.run_dir() / "todo.md").exists(), "挂起时应写 todo 投影")
 
-        todo_path = self.workspace / "todo.md"
+        todo_path = self.run_dir() / "todo.md"
         todo_text = todo_path.read_text(encoding="utf-8")
         todo_path.write_text(
             todo_text.replace("- [ ] H001 发布人审", "- [x] H001 发布人审"),

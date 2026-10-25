@@ -15,6 +15,7 @@ if str(TESTS_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(TESTS_DIRECTORY))
 
 import kernel_test_support as support  # noqa: E402
+from kernel_test_support import run_dir_for  # noqa: E402
 from flowrun.kernel.engine import (  # noqa: E402
     FlowWorkspaceMismatchError,
     run_flow,
@@ -32,20 +33,29 @@ class WorkspaceIdentityTestCase(unittest.TestCase):
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = support.KernelHookStubs()
 
+    def run_dir(self) -> Path:
+        """本次测试 run 的实际目录（T022：namespaced 布局在 <ws>/<run>/）。"""
+        return support.run_dir_for(self.workspace, support.DEFAULT_RUN_NAME)
+
     def run_flow_once(self, flow_ir) -> object:
         return asyncio.run(run_flow(flow_ir, self.workspace, self.stubs.build_hooks()))
 
     def reopened_ledger(self) -> EventLedger:
         """重开账本读取落账结果；注册清理，避免测试结束后遗留写句柄（ResourceWarning）。"""
-        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         self.addCleanup(ledger.close)
         return ledger
 
     # ---------------------------------------------------------------- 身份不匹配
 
-    def test_other_flow_on_same_workspace_raises_mismatch(self) -> None:
-        """FIX-B3 复现：A 图跑完的工作区再跑 B 图 → 抛 FlowWorkspaceMismatchError，
-        B 图整图不得执行（修复前会恢复出 A 的 flow_done 直接宣告完成）。"""
+    def test_other_flow_on_same_workspace_is_isolated_not_rejected(self) -> None:
+        """T022 语义 5：namespaced 布局下同工作区不同 run 各占 <ws>/<run>/，不拒绝。
+
+        改前（T022 之前）所有 run 共享根账本，A 图跑完的工作区再跑 B 图会撞
+        flow_started 的 run 名 → 抛 FlowWorkspaceMismatchError。T022 起每个 run
+        各自一份账本，冲突从"共享账本里 run 名不等"变成"路径根本不同"，因此 B 图
+        必须正常执行且不串账（legacy 根账本工作区仍按 fix-B3 拒绝，见
+        test_kernel_workspace_identity_strict 与 CLI 侧用例）。"""
         flow_a = support.make_flow_ir(
             [support.make_node("A001")], [], run_name="release-login-a"
         )
@@ -54,15 +64,26 @@ class WorkspaceIdentityTestCase(unittest.TestCase):
         )
         self.assertTrue(self.run_flow_once(flow_a).is_done())
 
-        with self.assertRaises(FlowWorkspaceMismatchError) as raised_context:
-            self.run_flow_once(flow_b)
+        final_state_b = self.run_flow_once(flow_b)  # 不得抛 FlowWorkspaceMismatchError
 
-        self.assertIn("release-login-a", str(raised_context.exception))
-        self.assertIn("release-login-b", str(raised_context.exception))
-        ledger = self.reopened_ledger()
+        self.assertTrue(final_state_b.is_done())
         self.assertEqual(
-            support.events_of_type(ledger, "agent_dispatched", "B001"), [],
-            "身份不匹配时 B 图不得投递任何节点",
+            [call[0] for call in self.stubs.dispatch_calls], ["A001", "B001"],
+            "两个 run 的节点都应真正投递（隔离而非拒绝）",
+        )
+        ledger_a = EventLedger(run_dir_for(self.workspace, "release-login-a") / "ledger.jsonl")
+        self.addCleanup(ledger_a.close)
+        ledger_b = EventLedger(run_dir_for(self.workspace, "release-login-b") / "ledger.jsonl")
+        self.addCleanup(ledger_b.close)
+        self.assertEqual(
+            [entry.node for entry in support.events_of_type(ledger_a, "agent_dispatched")],
+            ["A001"],
+            "A 的账本不得出现 B 的投递事件",
+        )
+        self.assertEqual(
+            [entry.node for entry in support.events_of_type(ledger_b, "agent_dispatched")],
+            ["B001"],
+            "B 的账本不得出现 A 的投递事件",
         )
 
     def test_same_run_name_but_foreign_node_set_raises_mismatch(self) -> None:
@@ -164,7 +185,7 @@ class WorkspaceIdentityTestCase(unittest.TestCase):
         说明：这是**纠正前置条件**（把"跳过校验"改成"拒绝"），不是放宽断言——
         被纠正的正是旧断言所钉住的宽松行为。"""
         flow_ir = support.make_flow_ir([support.make_node("T001")], [])
-        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         seeded_ledger.append(
             "flow_started",
             {"entry_nodes": ["T001"]},  # 故意不带 planned_nodes

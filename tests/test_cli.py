@@ -64,8 +64,8 @@ class CliTestCase(CliHarnessTestCase):
         )
         self.assertEqual(exit_code, 0)
         self.assertIn("flow: done", stdout_text)
-        self.assertTrue((self.workspace / "data/input.txt").exists())
-        self.assertTrue((self.workspace / "report/out.txt").exists())
+        self.assertTrue((self.run_dir("cli-linear") / "data/input.txt").exists())
+        self.assertTrue((self.run_dir("cli-linear") / "report/out.txt").exists())
 
     def test_run_stops_at_human_review_with_exit_one(self) -> None:
         flow_path = self.test_root / "human_gate.mmd"
@@ -93,7 +93,7 @@ class CliTestCase(CliHarnessTestCase):
             ["run", str(flow_path), "--workspace", str(self.workspace)]
         )
         self.assertEqual(run_code, 1)
-        todo_text = (self.workspace / "todo.md").read_text(encoding="utf-8")
+        todo_text = (self.run_dir("cli-gate-fail") / "todo.md").read_text(encoding="utf-8")
         self.assertIn("FLOW PAUSED", todo_text)
         self.assertIn("gate=retry", todo_text)
         self.assertIn("flowrun resume", todo_text)

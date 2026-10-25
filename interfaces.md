@@ -43,7 +43,9 @@ flowrun/
 │   │                            #     evidence_conversion / hooks_assembly / judge /
 │   │                            #     verdict_parsing / packet_builder / stub_generator /
 │   │                            #     todo_projection / todo_user_marks / state_summary /
-│   │                            #     workspace_session
+│   │                            #     workspace_session / workspace_layout / workspace_identity
+│   │                            #     （后两者 T022 新增：run 子目录布局唯一真相 + 身份校验，
+│   │                            #       workspace_identity 自 engine.py 纯搬移、原路径再导出）
 │   └── cli.py                   # 域D 最后装配
 ├── scripts/verify-install.ps1   # 发布门禁：GitHub 直装自验证
 ├── tests/                       # 各域自带测试文件
@@ -212,7 +214,7 @@ claude/opencode 两个适配器 + registry 的声明式注册，具体命令按 
 - engine/judge/todo_projection/stub_generator 只 import `ir.schema`、`state.ledger`、`state.snapshots`、`adapters.base`、`adapters.registry`，**不得**绕过接口直接读上游内部结构。
 - 判定 LLM 调用 = 通过适配器投递判定 packet（`__FLOW_PACKET__` 注入 JSON Schema 约束的判定提示），M1 不接任何 LLM SDK。
 - packet.md 格式按 design.md §4.3。
-- **工作区身份（fail-closed，M2 加固）**：`verify_workspace_matches_flow(flow_ir, ledger) -> None` 在**一切写入之前、零写入**执行，`run` 与 `resume` 同一套。空账本（`last_seq == 0`）= 新工作区，放行；其余一律以 `flow_started` 为身份真相源，其 `planned_nodes` 与当前图节点集**严格集合相等**（多一个/少一个都拒）。**"无法校验"不再等于放行**：账本非空却缺 `flow_started`、或 `flow_started` 的 `planned_nodes` 缺失/为空，均抛 `FlowWorkspaceMismatchError` → 退出码 `4` + "请换新工作区"。
+- **工作区身份（fail-closed，M2 加固）**：`verify_workspace_matches_flow(flow_ir, ledger) -> None` 在**一切写入之前、零写入**执行，`run` 与 `resume` 同一套。空账本（`last_seq == 0`）= 新工作区，放行；其余一律以 `flow_started` 为身份真相源，其 `planned_nodes` 与当前图节点集**严格集合相等**（多一个/少一个都拒）。**"无法校验"不再等于放行**：账本非空却缺 `flow_started`、或 `flow_started` 的 `planned_nodes` 缺失/为空，均抛 `FlowWorkspaceMismatchError` → 退出码 `4` + "请换新工作区"。**T022 起实现位于 `kernel/workspace_identity.py`**（自 `engine.py` 纯搬移，函数名/参数顺序/异常类型零变化，`kernel.engine` 原路径再导出）。多 run 共存由**布局**承载（见下），本校验守护的仍是"**这一份账本内**的 run 身份"——namespaced 下"同工作区不同 run"是不同路径的账本，不经拒绝分支；legacy 扁平仍严格拒绝。
 - **边身份与幂等键（M2 加固）**：`edge_taken` 的幂等键按**单条边**唯一——`<run>-edge-<index>-<source>-><target>-<kind>`（`index` 为边在 `flow_ir.edges` 中的声明序号，`kind ∈ {when, retry, timeout, auto}`），`payload` 含 `kind`；同源同目标的多条边因此各自落账，不再互相压制。**跨版本不兼容**：旧账本 `<run>-edge-<source>-<target>` 形式键与新格式不等值，升级请换新工作区。相关签名：`has_edge_been_taken(ledger, flow_ir, edge[, when_text])` / `append_edge_taken(ledger, flow_ir, edge[, when_text])`。
 - **判定异常终态（M2 加固）**：判定节点执行 judge 时抛异常 → 在边界捕获、异常**绝不穿透**，落**既有**终态事件 `node_failed`（沿用既有状态 `failed`，不新增事件类型），`payload["reason"] = "<异常类型>: <消息>"`（上限 500 字符后加 `...(已截断)`）；下游暂停由既有 `retry` 闸失败策略承接（**不**trip `verdict` 闸，避免同一次失败双重闸）。
 

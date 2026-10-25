@@ -29,12 +29,16 @@ class GateExemptionTestCase(unittest.TestCase):
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = support.KernelHookStubs()
 
+    def run_dir(self) -> Path:
+        """本次测试 run 的实际目录（T022：namespaced 布局在 <ws>/<run>/）。"""
+        return support.run_dir_for(self.workspace, support.DEFAULT_RUN_NAME)
+
     def run_flow_once(self, flow_ir) -> object:
         return asyncio.run(run_flow(flow_ir, self.workspace, self.stubs.build_hooks()))
 
     def reopened_ledger(self) -> EventLedger:
         """重开账本读取落账结果；注册清理，避免测试结束后遗留写句柄（ResourceWarning）。"""
-        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         self.addCleanup(ledger.close)
         return ledger
 
@@ -90,7 +94,7 @@ class GateExemptionTestCase(unittest.TestCase):
         gate_tripped。（上面的 budget 闸用例被"每闸至多一次"掩蔽，此例专门钉住换序。）"""
         entry_task = support.make_node("T001")
         flow_ir = support.make_flow_ir([entry_task], [], budget_tokens=1_000)
-        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         seeded_ledger.append(
             "flow_started",
             {
@@ -198,7 +202,7 @@ class GateExemptionTestCase(unittest.TestCase):
         resumed: bool = False,
     ) -> None:
         """手工播种到"已超限"状态：hop 计数由 agent_dispatched 现算，token 由 node_done 现算。"""
-        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         seeded_ledger.append(
             "flow_started",
             {

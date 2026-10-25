@@ -99,7 +99,7 @@ class UsageAccountingEndToEndTestCase(unittest.TestCase):
                 run_flow(flow_ir, workspace, stubs.build_hooks())
             )
             self.assertTrue(final_state.is_done())
-            ledger = EventLedger(workspace / "ledger.jsonl")
+            ledger = EventLedger(support.run_dir_for(workspace) / "ledger.jsonl")
             exited_events = support.events_of_type(ledger, "agent_exited", "T001")
             self.assertEqual(len(exited_events), 1)
             self.assertEqual(

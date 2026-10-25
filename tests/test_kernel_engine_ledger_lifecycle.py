@@ -34,15 +34,21 @@ class LedgerLifecycleTestCase(unittest.TestCase):
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = support.KernelHookStubs()
 
+    def run_dir(self, run_name: str = support.DEFAULT_RUN_NAME) -> Path:
+        """本次测试 run 的实际目录（T022：namespaced 布局在 <ws>/<run>/）。"""
+        return support.run_dir_for(self.workspace, run_name)
+
     def tearDown(self) -> None:
         self._temp_dir.cleanup()
 
-    def ledger_path(self) -> Path:
-        return self.workspace / "ledger.jsonl"
+    def ledger_path(self, run_name: str = support.DEFAULT_RUN_NAME) -> Path:
+        return self.run_dir(run_name) / "ledger.jsonl"
 
-    def assert_ledger_handle_released(self) -> Path:
+    def assert_ledger_handle_released(
+        self, run_name: str = support.DEFAULT_RUN_NAME
+    ) -> Path:
         """账本文件可被改名 = 追加句柄已关闭（Windows 上被占用时 rename 失败）。"""
-        original_path = self.ledger_path()
+        original_path = self.ledger_path(run_name)
         renamed_path = original_path.with_suffix(".moved")
         os.replace(original_path, renamed_path)
         self.assertTrue(renamed_path.exists())
@@ -58,15 +64,18 @@ class LedgerLifecycleTestCase(unittest.TestCase):
         self.assert_ledger_handle_released()
 
     def test_workspace_mismatch_releases_ledger_handle(self) -> None:
-        first_flow_ir = support.make_flow_ir(
-            [support.make_node("T001")], [], run_name="first-run"
-        )
+        """同 run 名但图被替换（节点超集）→ 身份校验拒绝后，run 自建账本句柄已释放。
+
+        T022 说明：namespaced 下"同工作区不同 run"各有目录、不再是身份冲突；
+        仍会拒绝的是**同一份账本**承载不同计划节点集（K2 超集）这一种 mismatch，
+        它发生在 run 自建自管账本的路径上，故句柄释放断言继续有效。
+        """
+        first_flow_ir = support.make_flow_ir([support.make_node("T001")], [])
         asyncio.run(run_flow(first_flow_ir, self.workspace, self.stubs.build_hooks()))
 
         second_flow_ir = support.make_flow_ir(
             [support.make_node("T001"), support.make_node("T002")],
             [support.make_edge("T001", "T002")],
-            run_name="second-run",
         )
         with self.assertRaises(FlowWorkspaceMismatchError):
             asyncio.run(

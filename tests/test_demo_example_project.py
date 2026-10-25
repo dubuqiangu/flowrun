@@ -29,10 +29,18 @@ for path_entry in (str(SOURCE_ROOT), str(DEMO_DIRECTORY)):
 
 import run_demo  # noqa: E402
 from flowrun.cli import main as cli_main  # noqa: E402
+from flowrun.kernel.workspace_layout import resolve_workspace_layout  # noqa: E402
+
+DEMO_RUN_NAME = "demo-release"
+
+
+def run_dir_of(workspace: Path) -> Path:
+    """样例 run 的实际目录（T022：根无账本 → namespaced <ws>/<run>/）。"""
+    return resolve_workspace_layout(workspace, DEMO_RUN_NAME).run_root
 
 
 def read_ledger_records(workspace: Path) -> list[dict]:
-    ledger_path = workspace / "ledger.jsonl"
+    ledger_path = run_dir_of(workspace) / "ledger.jsonl"
     return [
         json.loads(raw_line)
         for raw_line in ledger_path.read_text(encoding="utf-8").splitlines()
@@ -88,10 +96,11 @@ class DemoProjectTestCase(unittest.TestCase):
 
         self.assertEqual(first_exit_code, 1)
         self.assertIn("human_requested", event_types_of(workspace))
+        run_dir = run_dir_of(workspace)
         for product_relative_path in ("src/auth.py", "tests/test_auth.py", "src/ui/Login.jsx"):
-            self.assertTrue((workspace / product_relative_path).is_file())
-        self.assertTrue((workspace / "audit" / "T001-agent-1.stdout.log").is_file())
-        self.assertTrue((workspace / "audit" / "D001-judge-1.stdout.log").is_file())
+            self.assertTrue((run_dir / product_relative_path).is_file())
+        self.assertTrue((run_dir / "audit" / "T001-agent-1.stdout.log").is_file())
+        self.assertTrue((run_dir / "audit" / "D001-judge-1.stdout.log").is_file())
 
         self.assertEqual(
             self.invoke_cli(
@@ -104,7 +113,7 @@ class DemoProjectTestCase(unittest.TestCase):
         )
         self.assertEqual(second_exit_code, 0)
         self.assertEqual(event_types_of(workspace)[-1], "flow_done")
-        self.assertTrue((workspace / "release-tag.txt").is_file())
+        self.assertTrue((run_dir_of(workspace) / "release-tag.txt").is_file())
 
     def test_missing_outputs_trip_retry_gate(self) -> None:
         flow_path = self.build_flow("demo_fail.mmd", worker_extra_arguments="--mode lie")
@@ -114,7 +123,7 @@ class DemoProjectTestCase(unittest.TestCase):
         recorded_types = event_types_of(workspace)
         self.assertIn("node_failed", recorded_types)
         self.assertIn("gate_tripped", recorded_types)
-        self.assertFalse((workspace / "src" / "auth.py").exists())
+        self.assertFalse((run_dir_of(workspace) / "src" / "auth.py").exists())
         failed_node_payload = next(
             record["payload"]
             for record in read_ledger_records(workspace)

@@ -61,11 +61,15 @@ class JudgeFailureTerminalTestCase(unittest.TestCase):
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = support.KernelHookStubs()
 
+    def run_dir(self) -> Path:
+        """本次测试 run 的实际目录（T022：namespaced 布局在 <ws>/<run>/）。"""
+        return support.run_dir_for(self.workspace, support.DEFAULT_RUN_NAME)
+
     def run_flow_once(self, flow_ir) -> object:
         return asyncio.run(run_flow(flow_ir, self.workspace, self.stubs.build_hooks()))
 
     def reopened_ledger(self) -> EventLedger:
-        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         self.addCleanup(ledger.close)
         return ledger
 

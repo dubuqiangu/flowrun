@@ -39,14 +39,18 @@ class StrictWorkspaceIdentityTestCase(unittest.TestCase):
         self.workspace = Path(self._temp_dir.name) / "workspace"
         self.stubs = support.KernelHookStubs()
 
+    def run_dir(self) -> Path:
+        """本次测试 run 的实际目录（T022：namespaced 布局在 <ws>/<run>/）。"""
+        return support.run_dir_for(self.workspace, support.DEFAULT_RUN_NAME)
+
     def open_ledger(self) -> EventLedger:
-        ledger = EventLedger(self.workspace / "ledger.jsonl")
+        ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         self.addCleanup(ledger.close)
         return ledger
 
     def seed_ledger_with_events(self, *events) -> None:
         """按 (type, payload, idem, node) 播种账本（不落 flow_started，模拟异常账本）。"""
-        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         try:
             for event_type, payload, idem_key, node_id in events:
                 seeded_ledger.append(
@@ -196,8 +200,8 @@ class StrictWorkspaceIdentityTestCase(unittest.TestCase):
     def test_empty_ledger_is_not_rejected(self) -> None:
         """空账本（0 字节）= 全新工作区：必须放行，不得被缺陷 1 的收紧误伤。"""
         flow_ir = support.make_flow_ir([support.make_node("T001")], [])
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        (self.workspace / "ledger.jsonl").write_bytes(b"")
+        self.run_dir().mkdir(parents=True, exist_ok=True)
+        (self.run_dir() / "ledger.jsonl").write_bytes(b"")
 
         verify_workspace_matches_flow(flow_ir, self.open_ledger())  # 不抛
 

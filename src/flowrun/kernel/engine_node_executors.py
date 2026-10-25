@@ -44,6 +44,7 @@ from .decision_executor import (
     describe_judge_failure,
     execute_decision,
 )
+from .workspace_layout import PACKETS_DIRECTORY_NAME
 from .engine_evidence import (
     EvidencePack,
     assemble_evidence_pack,
@@ -142,7 +143,7 @@ async def _execute_task(
         return
     attempt = count_node_events(ledger, "agent_dispatched", task_node.node_id) + 1
     packet_path = run_hooks.build_task_packet(
-        flow_ir, task_node, workspace, workspace / "packets"
+        flow_ir, task_node, workspace, workspace / PACKETS_DIRECTORY_NAME
     )
     ledger.append(
         "agent_dispatched",

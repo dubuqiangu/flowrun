@@ -39,7 +39,7 @@ class KernelEngineRecoveryTestCase(KernelGatesHarnessTestCase):
             [flaky_task, downstream_task],
             [support.make_edge("T001", "T002", retry=1)],
         )
-        crashed_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        crashed_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         crashed_ledger.append(
             "flow_started",
             {"entry_nodes": ["T001"], "planned_nodes": ["T001", "T002"]},
@@ -141,7 +141,7 @@ class DecisionNodeTimeoutRecoveryTestCase(KernelGatesHarnessTestCase):
 
     def seed_crashed_decision_dispatch(self, flow_ir, with_timeout_exit: bool) -> None:
         """播种"判定已投递、随后崩溃"的账本（形状与生产判定路径落账一致）。"""
-        seeded_ledger = EventLedger(self.workspace / "ledger.jsonl")
+        seeded_ledger = EventLedger(self.run_dir() / "ledger.jsonl")
         seeded_ledger.append(
             "flow_started",
             {"entry_nodes": ["D001"], "planned_nodes": ["D001", "T002", "T003"]},

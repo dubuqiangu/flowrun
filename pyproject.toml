@@ -1,12 +1,12 @@
-# 注:PyPI 上 flowrun 分发名已被占用(现有包 0.2.0)——本文件用于
-# `pip install git+...` 直装与本地构建;未来发 PyPI 需改用其他分发名
-# (tasks.md M3-T027 定名查重)。
+# 发行名 flowrun-mmd(T027 拍板):PyPI 的 flowrun 已被他人占用,且商标/生态查重
+# flowrun-mmd 在 USPTO/EUIPO(09/42 类)、PyPI、npm、crates.io、GitHub 全部 clear。
+# 仓库名与导入名仍为 flowrun,仅发行元数据用 flowrun-mmd。
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flowrun"
+name = "flowrun-mmd"
 version = "0.1.0"
 description = "Mermaid 流程图驱动的多 Agent 编排运行时:编译器 + 事件账本状态层 + CLI Agent 适配 + 判定/人审引擎"
 readme = "README.md"

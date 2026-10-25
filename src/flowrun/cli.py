@@ -60,6 +60,7 @@ from flowrun.kernel.workspace_session import (
     workspace_is_initialized,
     workspace_ledger_path,
 )
+from flowrun.kernel.workspace_layout import resolve_layout_for_read
 from flowrun.state.flow_state import (
     STATUS_AWAITING_HUMAN,
     STATUS_DONE,
@@ -230,21 +231,25 @@ def _handle_run(parsed_args: argparse.Namespace) -> int:
     # 账本单实例：本次 run 全程只开这一个 EventLedger，依次喂 build_engine_hooks /
     # run_flow（借用，绝不由内核 close）/ write_todo / print_state_summary，
     # 最后一次 close（进程内不再出现第二个指向 ledger.jsonl 的写者）。
-    ledger, flow_state = open_workspace_state(workspace)
+    layout = resolve_layout_for_read(workspace, flow_ir.run_name)
+    ledger, flow_state = open_workspace_state(workspace, flow_ir.run_name)
     try:
         verify_workspace_matches_flow(flow_ir, ledger)
-        workspace.mkdir(parents=True, exist_ok=True)
+        layout.run_root.mkdir(parents=True, exist_ok=True)
         # 上轮等待点留在 todo.md 的勾选/@pause/@skip/@resume 先落账，再驱动内核
-        apply_user_marks(flow_ir, workspace / "todo.md", ledger, flow_state)
+        apply_user_marks(flow_ir, layout.todo_path, ledger, flow_state)
 
-        generate_agents_stub(flow_ir, workspace)
+        # AGENTS.stub.md 属工作区级资产：写工作区根，各 run 共享同一份。
+        generate_agents_stub(flow_ir, layout.workspace_root)
         engine_hooks = build_engine_hooks(
-            flow_ir, workspace, ledger, parsed_args.dispatch_timeout
+            flow_ir, layout.run_root, ledger, parsed_args.dispatch_timeout
         )
-        final_state = asyncio.run(run_flow(flow_ir, workspace, engine_hooks, ledger))
+        final_state = asyncio.run(
+            run_flow(flow_ir, layout.run_root, engine_hooks, ledger)
+        )
         # 内核收口时写的 todo 拿不到闸 payload：用同一账本重写一次补 PAUSED 头注释；
         # 同一句柄顺带喂给摘要读 node_failed payload（T020j），读完即关。
-        write_todo(flow_ir, final_state, workspace / "todo.md", ledger)
+        write_todo(flow_ir, final_state, layout.todo_path, ledger)
         print_state_summary(
             flow_ir,
             final_state,
@@ -264,10 +269,10 @@ def _handle_resume(parsed_args: argparse.Namespace) -> int:
     """解除闸/暂停挂起：身份校验 → 状态校验 → 落 flow_resumed（唯一 cli 通道）。"""
     flow_ir = _compile_flow_file(Path(parsed_args.flow))
     workspace = Path(parsed_args.workspace)
-    if not workspace_is_initialized(workspace):
+    if not workspace_is_initialized(workspace, flow_ir.run_name):
         print("flowrun: 工作区未初始化（缺少 ledger.jsonl）", file=sys.stderr)
         return EXIT_WORKSPACE_MISSING
-    ledger, flow_state = open_workspace_state(workspace)
+    ledger, flow_state = open_workspace_state(workspace, flow_ir.run_name)
     try:
         # 身份校验唯一真相在 kernel.engine.verify_workspace_matches_flow（零写入纯查询，
         # 可直接在已打开的账本上调用），与 run 同口径：不仅比 run 名，同 run 名而节点集
@@ -305,11 +310,15 @@ def _handle_deny(parsed_args: argparse.Namespace) -> int:
 
 def _handle_status(parsed_args: argparse.Namespace) -> int:
     workspace = Path(parsed_args.workspace)
-    if not workspace_is_initialized(workspace):
+    # status 不强制 --flow，故 run 名可能未知：只给了 run 名(经 --flow 编译)时按
+    # 该 run 的账本读；未给时按工作区根读（legacy / 单 run 工作区的既有语义）。
+    flow_ir = _compile_flow_file(Path(parsed_args.flow)) if parsed_args.flow else None
+    run_name = flow_ir.run_name if flow_ir is not None else None
+    layout = resolve_layout_for_read(workspace, run_name)
+    if not layout.ledger_path.exists():
         print("flowrun: 工作区未初始化（缺少 ledger.jsonl）", file=sys.stderr)
         return EXIT_WORKSPACE_MISSING
-    flow_ir = _compile_flow_file(Path(parsed_args.flow)) if parsed_args.flow else None
-    ledger, flow_state = open_workspace_state(workspace)
+    ledger, flow_state = open_workspace_state(workspace, run_name)
     try:
         print_state_summary(
             flow_ir, flow_state, title=f"flowrun status: {workspace}", ledger=ledger
@@ -324,15 +333,16 @@ def _handle_status(parsed_args: argparse.Namespace) -> int:
 def _handle_todo(parsed_args: argparse.Namespace) -> int:
     flow_ir = _compile_flow_file(Path(parsed_args.flow))
     workspace = Path(parsed_args.workspace)
-    if not workspace_is_initialized(workspace):
+    if not workspace_is_initialized(workspace, flow_ir.run_name):
         print("flowrun: 工作区未初始化（缺少 ledger.jsonl）", file=sys.stderr)
         return EXIT_WORKSPACE_MISSING
-    ledger, flow_state = open_workspace_state(workspace)
+    layout = resolve_layout_for_read(workspace, flow_ir.run_name)
+    ledger, flow_state = open_workspace_state(workspace, flow_ir.run_name)
     try:
         applied_event_count = apply_user_marks(
-            flow_ir, workspace / "todo.md", ledger, flow_state
+            flow_ir, layout.todo_path, ledger, flow_state
         )
-        write_todo(flow_ir, flow_state, workspace / "todo.md", ledger)
+        write_todo(flow_ir, flow_state, layout.todo_path, ledger)
     finally:
         ledger.close()
     print(f"todo 投影已重写，应用了 {applied_event_count} 条用户标记")
@@ -364,7 +374,8 @@ def _resolve_human_node(parsed_args: argparse.Namespace, decision: str) -> int:
         print(f"flowrun: 流程图中不存在节点 {node_id}", file=sys.stderr)
         return EXIT_WAITING
     workspace = Path(parsed_args.workspace)
-    ledger, flow_state = open_workspace_state(workspace)
+    layout = resolve_layout_for_read(workspace, flow_ir.run_name)
+    ledger, flow_state = open_workspace_state(workspace, flow_ir.run_name)
     try:
         node_status = flow_state.node_status(node_id)
         if decision == "approve" and node_status == STATUS_DONE:
@@ -381,8 +392,8 @@ def _resolve_human_node(parsed_args: argparse.Namespace, decision: str) -> int:
             )
             return EXIT_WAITING
         append_human_resolution(flow_ir, ledger, node_id, decision)
-        updated_state = recover_flow_state(ledger, SnapshotStore(workspace / "snapshots"))
-        write_todo(flow_ir, updated_state, workspace / "todo.md", ledger)
+        updated_state = recover_flow_state(ledger, SnapshotStore(layout.snapshots_dir))
+        write_todo(flow_ir, updated_state, layout.todo_path, ledger)
     finally:
         ledger.close()
     decision_text = "通过" if decision == "approve" else "否决"

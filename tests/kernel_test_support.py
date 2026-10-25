@@ -28,6 +28,7 @@ from flowrun.ir.schema import (  # noqa: E402
     NodeSpec,
 )
 from flowrun.kernel.engine import EngineHooks  # noqa: E402
+from flowrun.kernel.workspace_layout import resolve_workspace_layout  # noqa: E402
 from flowrun.state.ledger import EventLedger, LedgerEntry  # noqa: E402
 
 FAKE_AGENT_SCRIPT_PATH = PROJECT_ROOT / "tests" / "fixtures" / "fake_flow_agent.py"
@@ -100,6 +101,16 @@ def events_of_type(
         for entry in ledger.entries()
         if entry.type == event_type and (node_id is None or entry.node == node_id)
     ]
+
+
+def run_dir_for(workspace: Path, run_name: str = DEFAULT_RUN_NAME) -> Path:
+    """测试用：该 run 的实际目录（T022：legacy 在根，namespaced 在 <ws>/<run>/）。"""
+    return resolve_workspace_layout(Path(workspace), run_name).run_root
+
+
+def run_ledger_path(workspace: Path, run_name: str = DEFAULT_RUN_NAME) -> Path:
+    """测试用：该 run 的账本路径（只推导，不打开文件）。"""
+    return resolve_workspace_layout(Path(workspace), run_name).ledger_path
 
 
 # ---------------------------------------------------------------- hook stub

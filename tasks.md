@@ -336,8 +336,11 @@
 
 - [ ] **T021 并行调度**：`when: all` barrier 完整化，多任务节点并发投递、join 等齐。
   - 验收：双任务并发后 join 正确等齐；单侧失败走失败路径。
-- [ ] **T022 多 run 隔离**：run_id 全链路贯穿（ledger/packet/todo/工作目录）。
-  - 验收：双 run 并发互不串扰。
+- [x] **T022 多 run 隔离（✅ 2026-10-25 完成）**：run_id 全链路贯穿（ledger/packet/todo/工作目录）。
+  - **实现**：`kernel/workspace_layout.py`（布局唯一真相：判据＝工作区根有无 `ledger.jsonl`——有则 legacy 扁平零迁移，无则 namespaced `<ws>/<run>/` 五件套 ledger/snapshots/packets/audit/todo）+ `kernel/workspace_identity.py`（身份校验，engine.py 原路径再导出，契约零变化）；namespaced 下同工作区不同 run 为**路径隔离**（不拒绝），legacy 仍严格拒；`AGENTS.stub.md` 等工作区级资产留根；namespaced 下 agent cwd = `layout.run_root`。
+  - 验收：双 run **并发**互不串扰——`tests/test_workspace_run_isolation.py::WorkspaceRunIsolationTestCase` 四条：legacy 零迁移、namespaced 五件套、双 run 串行隔离、`test_concurrent_runs_in_one_workspace_do_not_interfere`（Barrier 双线程真并发）；身份语义改写见 `tests/test_kernel_engine_workspace_identity.py::test_other_flow_on_same_workspace_is_isolated_not_rejected`。
+  - 验收证据：`PYTHONPATH=src PYTHONWARNINGS=always::ResourceWarning python -m unittest discover -s tests` → **529 tests OK、ResourceWarning 0**；全仓 `git ls-files --eol` 无 `w/crlf`；AST 0 错；>400 行仅豁免的 `cli.py`(405)。
+  - **行为变更（升级前请读）**：① 新工作区（根无账本）按 run 分包进 `<ws>/<run>/`，不同 run 的账本/packets/todo/audit/snapshots 完全隔离；② namespaced 下 agent cwd 为 run 根而非工作区根；③ 旧工作区（根有 `ledger.jsonl`）**零迁移**，布局与身份拒绝语义完全不变。
 - [ ] **T023 只读观测 GUI**：读 ledger/快照渲染流程状态与成本（usage 汇总）。
   - 验收：严格只读，无任何写通道。
 - [ ] **T024 交互图模板库**：`docs/` 下 sequenceDiagram 协议文档模板 + AGENTS.stub.md 引用生成。
@@ -346,15 +349,15 @@
   - 验收：三家中最弱信号源下判定器仍可靠。
 - [ ] **T026 subgraph 子流程语义评估**：是否升级为可执行单元（带结论的评估文档即可）。
 - **[部分完成] T027 发布准备**：
-  - [x] **定名**：`flowrun`（`pyproject.toml` `name = "flowrun"`，版本 `0.1.0`；仓库名同）。
+  - [x] **定名**：发行名 `flowrun-mmd`（`pyproject.toml` `name = "flowrun-mmd"`，版本 `0.1.0`；仓库名保持 `flowrun`，`import` 名保持 `flowrun`，见下条拍板）。
   - [x] **README**：已成型（快速开始 / 功能一览 / todo 指令标记 / 监控面 / 样例入口）。
   - [x] **许可协议**：**MIT**（`LICENSE` + `pyproject.toml` `license = "MIT"`，版权行 `Copyright (c) 2026 dubuqiangu`）。原计划倾向于 Apache-2.0，实际落地为 MIT——MIT 更短、更接纳下游任意复用，与"只做流程控制、不绑定生态"的定位一致。
-  - [ ] **重名 / 商标查重（2026-10-21 已完成公开渠道检索，结论见下）**：
-    - **PyPI：已被他占**。`flowrun` 存在于 PyPI，作者 `pskishere`，最新 `0.2.0`（2021-01-02），历史 11 个版本。`pip install flowrun` 会装到别人那个包 → **本项目不能直接以 `flowrun` 之名上 PyPI**。
-    - **npm：未占**。`registry.npmjs.org/flowrun` 返回 `404 Not Found`。
-    - **GitHub：85 个仓库含 `flowrun`，其中同名或近同名 4 个**：`sacode387/FlowRun`（Scala，59★，"Runnable flowcharts for the web"，2026-10-18 仍在推）、`dnan04/FlowRun`（Python，1★，"自助跑数平台"）、`yametech/flowrun`（Python，1★，FSM echoer SDK）、**`runboktu/FlowRun`（Rust，1★，"Production-grade orchestration engine for autonomous AI agents"，与本项目定位最接近，需重点区分）**；另有 `flowrunner` 系列（`nidyran/Flowrunner` 8★ 2026-10-20 在推、`devhelpr/flowrunner` 已归档）。
-    - **商标：未检索**。USPTO 公开检索无稳定可自动化端点（实测 `tmsearch` API 返回 `NoSuchKey`），故商标状态**存疑、未验证**——需人工在 [tmsearch.uspto.gov](https://tmsearch.uspto.gov) 与 [EUIPO](https://euipo.europa.eu) 检索 `flowrun` / `flow run`，尤其 Software 类（Nice 09 / 42）。
-    - **结论与待决策**：仓库名保持 `flowrun`（用户明确要求），但**发行名必须改**——以下候选已逐个实测 PyPI JSON 端点均返回 `404`（可用，2026-10-21）：`flowrun-orchestrator`、`flowrun-mmd`、`pyflowrun-mmd`、`flowrun-cli`、`flowrun-core`。**推荐 `flowrun-mmd`**：`runboktu/FlowRun` 已自述为 "orchestration engine for autonomous AI agents"，用 `-orchestrator` 反而贴上去制造混淆；而"由 Mermaid 驱动"才是本项目的独有识别点（Mermaid 是真相源、todo 是投影）。**发行名未定，故未改 `pyproject.toml`**：改名要动发行元数据并影响 `verify-install.ps1` 的包树核对，需用户拍板后一次性完成（`import flowrun` 保持不动即可，发行名与导入名可以不同）。
+  - [x] **重名 / 商标查重（✅ 2026-10-25 全部完成，结论见下）**：
+    - **PyPI：已被他占**。`flowrun` 存在于 PyPI，作者 `pskishere`，最新 `0.2.0`（2021-01-02），历史 11 个版本。`pip install flowrun` 会装到别人那个包 → **本项目不能直接以 `flowrun` 之名上 PyPI**。`flowrun-mmd` 返回 404，可用。
+    - **npm / crates.io：均未占**。`registry.npmjs.org/flowrun` 与 `crates.io/api/v1/crates/flowrun` 均 404（`flowrun-mmd` 同样 404）。
+    - **GitHub：`flowrun` 命名空间拥挤**（`sacode387/FlowRun` 59★ Scala、`runboktu/FlowRun` Rust 与本项目定位最接近、`nidyran/Flowrunner` 8★ 等）；**`flowrun-mmd` 0 仓库、0 代码命中**，完全空闲。
+    - **商标（✅ 2026-10-25 检索完成，替代原"未验证"状态）**：USPTO tmsearch 引号精确短语检索 `flowrun`、`flowrun-mmd` 均 **total 0**（09/42 类；最近邻 FLOWRUNNER 序列号 98719235 / FLOWPHYSIX INC. 属 IC 010 不同类，记录但不构成冲突）；EUIPO `/copla/ctmsearch/json` 同检索两名均 **0 命中**（用 microsoft=97、flow=1288 对照查询验证过端点有效）。**两候选名商标均 clear**。局限如实记录：websearch 不可用，未查 WIPO/Madrid——但两查询总命中即为 0，类别细分不影响结论。
+    - **结论与拍板（2026-10-25 用户裁定）**：**发行名 = `flowrun-mmd`**——USPTO/EUIPO(09/42)/PyPI/npm/crates.io/GitHub 七处全 clear，且"由 Mermaid 驱动"是本项目独有识别点；`flowrun` 则有 PyPI 冲突与 GitHub 命名空间拥挤两处硬伤。**已落地**：`pyproject.toml` `name = "flowrun-mmd"`（版本仍 `0.1.0`），`scripts/verify-install.ps1` 元数据核对改读 `metadata.version('flowrun-mmd')`；仓库名保持 `flowrun`、`import flowrun` 与 console script `flowrun` 均不动。PyPI 实际上传（`twine` 发布流程）留待正式发布时执行。
 
 ---
 
