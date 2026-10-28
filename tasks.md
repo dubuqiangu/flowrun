@@ -74,14 +74,19 @@
 - [ ] **T015 ACP 适配器**：PromptResponse.stopReason → 完成语义；tool_call/usage_update 进观测；session/cancel 接入中断。
   - 验收：verdict 证据包可引用 ACP turn 的结构化事件（含 cost）。
 
-- [ ] **T016 人审双通道**：`human_requested/human_resolved` 事件 + todo 勾选通道；ACP `request_permission` 映射同一 schema。
+- [ ] **T016 人审双通道（半实现，拆两子项）**：`human_requested/human_resolved` 事件 + todo 勾选通道；ACP `request_permission` 映射同一 schema。
+  - [x] todo 勾选通道 + `human_requested/human_resolved` 事件（已实现：`kernel/engine_node_executors.py` 生产 `human_requested`；`kernel/workspace_session.py::append_human_resolution` 落 `human_resolved`；todo 投影见 `kernel/todo_projection.py`）
+  - [ ] ACP `request_permission` → 同一 human 事件 schema 的映射（未实现，依赖 T014/T015）
   - 验收：审批未决时图静止（无节点进入 running）。
 
 - [ ] **T017 elicitation 表单映射**：ACP 结构化审批表单 → 审批结果结构化落账。
   - 验收：审批结果带选项与上下文，ledger 可重放。
 
-- [ ] **T018 retry/timeout 边语义**：`retry: N` 耗尽转人审；`timeout: 30m` 到点走指定边（双信号竞速的优雅杀进程组 + 留 `agent_exited` 审计事件）。
+- [x] **T018 retry/timeout 边语义（✅ 已实现）**：`retry: N` 耗尽转人审；`timeout: 30m` 到点走指定边（双信号竞速的优雅杀进程组 + 留 `agent_exited` 审计事件）。
   - 验收：超时分支被实际触发并落账；重试计数跨进程恢复正确。
+  - **实现**：`kernel/engine_graph.py`（`is_timeout_edge` / `first_timeout_edge` / `first_retry_edge` / `first_dispatch_timeout`）+ `kernel/engine_gates.py::resolve_failed_node_policy`（超时优先走分支、否则 retry requeue、耗尽或无重试边转人审）+ `kernel/engine.py::_apply_failure_policy`（执行三条动作）。
+  - **验收证据**：`PYTHONPATH=src PYTHONWARNINGS=always::ResourceWarning python -m unittest discover -s tests` → **529 tests OK**（基线计数，未增补）。超时/重试的覆盖用例所在文件：`tests/test_kernel_engine_gates.py`（`test_retry_requeues_until_success` / `test_timeout_branch_edge_taken_on_dispatch_timeout`）、`tests/test_kernel_engine_gates_recovery.py`（`make_timeout_branch_flow_ir` / `test_crashed_timed_out_decision_dispatch_walks_timeout_branch`）、`tests/test_kernel_engine_terminal_state_guards.py`（`test_ledger_seeded_failed_node_with_retry_edge_is_still_requeued` / `test_ledger_seeded_timed_out_node_still_walks_timeout_branch`）。
+  - **行为变更说明（升级前请读）**：超时分支由失败处置策略显式走边；重试计数跨进程经 `node_entered` 的 `failure_count` 恢复。**失败/重试耗尽转人审的闸名自 T020e（2026-10-28）起为 `retry_exhausted`**（不再是含糊的 `retry`），与机器闸区分。
 
 - [ ] **T019 断点续跑端到端**：快照+重放 + 适配器会话续跑（Claude `--resume` / opencode `-s`）。
   - 验收：中断后续跑幂等（同一节点不会二次向 agent 投递 packet）。
@@ -95,9 +100,13 @@
 - [x] **T020b 审计文件归位（✅ 第八轮已落地）**：agent stdout/stderr 审计落 `audit/` 子目录而非工作区根；命名 `<node_id>-<kind>-<attempt>.stdout.log`（`.stderr.log` 配对），`kind ∈ {agent, judge, no-adapter}`，`attempt` 由账本 `agent_dispatched` 条数重建；证据/`agent_exited` 引用**相对工作区根**的路径。写侧与读侧共用同一命名函数（`adapters/audit_paths.py`），缺文件退空 `audit_tail`、绝不报错。
 - [x] **T020c apply_user_marks 降噪**：done 派生的 `[x]` 行不再每轮重复告警。（2026-10-16 审计批次 C 线落地：非人审节点的派生勾选静默跳过，仅"未生效过"的标记告警并钉桩测试。）
 - [x] **T020d EventLedger 单实例化（✅ 第八轮已落地）**：`run_flow(..., ledger=None)` 改为**借用语义**——传入即共用（**永不 close**），只有 `None` 时自建并自管；`cli._handle_run` 整轮只开一个 `EventLedger` 并在结束时关一次（"重开只为读 PAUSED 头部"的旧分支已删）；`hooks_assembly._JudgeLedgerRecorder(ledger)` 持共享实例、只读不写（单一写者纪律）。
-- [ ] **T020e 失败处置语义定稿**：无 retry 边的失败节点当前触发 `gate_tripped(gate="retry", limit=0)`，与三闸语义混淆——定稿为独立的人审等待事件（`node_failed` → 明确的转人审标记），并区分 gate_tripped。
+- [x] **T020e 失败处置语义定稿（✅ 2026-10-28 完成）**：无 retry 边的失败节点（或重试耗尽）当前触发 `gate_tripped(gate="retry", limit=0)`，与机器闸（hop/budget/verdict/illegal_edge）语义混淆——**用户拍板：独立闸名 `retry_exhausted`**，与机器闸区分。
+  - 实现：`kernel/engine_gates.py` 新增 `GATE_RETRY_EXHAUSTED = "retry_exhausted"`（保留 `GATE_RETRY` 但标注废弃、src/ 内已无消费者，仅兼容旧账本）；`kernel/engine.py::_apply_failure_policy` 的 `FAILURE_ACTION_TRIP_GATE` 分支改用 `GATE_RETRY_EXHAUSTED`；沿用"每工作区每闸名至多一次 + resume 豁免"的既有闸幂等语义。
+  - 验收证据：`PYTHONPATH=src PYTHONWARNINGS=always::ResourceWarning python -m unittest discover -s tests` → **529 tests OK、ResourceWarning 0**；16 处测试断言逐场景核对改为 `retry_exhausted`（覆盖失败/耗尽、并行失败幂等、反复 run、resume 接管、判定失败、恢复路径；REQUEUE 分支的 `node_entered reason="retry"` 是重入队原因**非闸名**，保留不动）。
+  - **行为变更（升级前请读）**：失败/重试耗尽转人审现在落 `gate_tripped(gate="retry_exhausted")` 而非 `gate_tripped(gate="retry")`——`tripped_gates()` 不再出现含糊的 "retry"；配合 T020j 失败归因行，`failed` 节点 + 触发闸列显示 `retry_exhausted` 即明确表示"失败待人工处置"。旧账本中的 `gate="retry"` 记录仍按原语义读取，不迁移。
 - [x] **T020f FallbackAdapter 结构化提取（✅ 第八轮已落地）**：改为**声明式约定**——行内**最后一个**顶层 JSON 对象若含 `usage` / `total_tokens` 键（明细 dict 或数字，bool/字符串不算）即搬进 `structured_result`，键名与 `extract_usage_tokens` **同一口径**（总数优先、分量不重复累加），且**绝不置位语义完成信号**（兜底适配器仍只认"退出码 + 超时"）。长尾 CLI 的 **task 路径** `token_spent` 不再恒 0，端到端已钉进 `agent_exited.tokens` 并可触发 budget 闸。原"测试侧适配器去重"读法经核验**无重复可去**（唯一计数适配器已在共享支持模块）。
 - [ ] **T020g opencode 语义信号真机采样**：采集 `opencode run --format json` 真实输出样例，核定 idle/end 判定形态（当前为两类合理形态猜测实现）。
+  - **采样脚本 `scripts/sample_opencode_semantics.ps1` 已就位**；真机采样待手动执行（需真实 opencode 终端），样本就绪后定稿 idle/end 判定形态。
 - [x] **T020h 文档位置修正**：`compile_flow_source` 实际位于 `flowrun.compiler.validator`（简报曾误标 mermaid_parser）。**核验结论**：全文检索 `*.md` 后，interfaces.md 目录树与各任务书均无该误标引用，无需改动即关闭。
 
 ---

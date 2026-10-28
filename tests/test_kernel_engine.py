@@ -91,7 +91,7 @@ class KernelEngineTestCase(unittest.TestCase):
         )
         final_state = self.run_flow_once(flow_ir)
         self.assertTrue(final_state.is_paused())
-        self.assertIn("retry", final_state.tripped_gates())
+        self.assertIn("retry_exhausted", final_state.tripped_gates())
         failed_events = support.events_of_type(self.reopened_ledger(), "node_failed", "T001")
         self.assertEqual(len(failed_events), 1)
         self.assertEqual(failed_events[0].payload["exit_code"], 3)

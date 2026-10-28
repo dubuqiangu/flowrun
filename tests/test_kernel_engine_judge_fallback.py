@@ -121,7 +121,7 @@ class JudgeFallbackTestCase(unittest.TestCase):
         self.assertIn("FileNotFoundError", failure_reason)
         self.assertIn("可执行文件不存在", failure_reason)
         self.assertEqual(support.events_of_type(ledger, "verdict", "D001"), [])
-        self.assertIn("retry", final_state.tripped_gates())
+        self.assertIn("retry_exhausted", final_state.tripped_gates())
         self.assertEqual(final_state.node_status("T002"), "planned")
 
     # ---------------------------------------------------------------- 正常路径不受影响

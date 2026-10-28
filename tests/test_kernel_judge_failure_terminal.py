@@ -115,7 +115,7 @@ class JudgeFailureTerminalTestCase(unittest.TestCase):
         final_state = self.run_flow_once(flow_ir)
 
         self.assertTrue(final_state.is_paused())
-        self.assertEqual(final_state.tripped_gates(), ("retry",))
+        self.assertEqual(final_state.tripped_gates(), ("retry_exhausted",))
         self.assertEqual(
             [dispatch_call[0] for dispatch_call in self.stubs.dispatch_calls], ["T001"],
             "判定失败后不得投递下游任务节点",

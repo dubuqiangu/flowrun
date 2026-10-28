@@ -107,7 +107,7 @@ class KernelEngineTerminalStateGuardsTestCase(KernelGatesHarnessTestCase):
         first_state = self.run_flow_once(flow_ir)
 
         self.assertEqual(first_state.node_status("X001"), "failed")
-        self.assertIn("retry", first_state.tripped_gates())
+        self.assertIn("retry_exhausted", first_state.tripped_gates())
         first_ledger = self.reopened_ledger()
         late_edges = [
             edge_entry
@@ -232,7 +232,7 @@ class KernelEngineTerminalStateGuardsTestCase(KernelGatesHarnessTestCase):
             "语义完成信号 + 产物齐时，非零退出码不得把节点判失败",
         )
         self.assertEqual(len(support.events_of_type(ledger, "node_done", "T001")), 1)
-        self.assertNotIn("retry", final_state.tripped_gates())
+        self.assertNotIn("retry_exhausted", final_state.tripped_gates())
         exit_events = support.events_of_type(ledger, "agent_exited", "T001")
         self.assertEqual(exit_events[0].payload["exit_code"], 1)
         self.assertTrue(exit_events[0].payload["semantic_done"])

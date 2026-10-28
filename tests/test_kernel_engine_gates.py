@@ -64,7 +64,7 @@ class KernelEngineGatesTestCase(KernelGatesHarnessTestCase):
         final_state = self.run_flow_once(flow_ir)
         self.assertTrue(final_state.is_paused())
         self.assertIn("hop", final_state.tripped_gates())
-        self.assertNotIn("retry", final_state.tripped_gates())
+        self.assertNotIn("retry_exhausted", final_state.tripped_gates())
         self.assertEqual(len(self.stubs.dispatch_calls), 9,
                          "hop 上限 4×2=8，第 9 次投递后下一轮闸停")
         ledger = self.reopened_ledger()
@@ -117,7 +117,7 @@ class KernelEngineGatesTestCase(KernelGatesHarnessTestCase):
         )
         final_state = self.run_flow_once(flow_ir)
         self.assertTrue(final_state.is_paused())
-        self.assertIn("retry", final_state.tripped_gates())
+        self.assertIn("retry_exhausted", final_state.tripped_gates())
         self.assertEqual(len(self.stubs.dispatch_calls), 2, "retry:1 = 共两次尝试")
         gate_events = support.events_of_type(self.reopened_ledger(), "gate_tripped")
         self.assertEqual(gate_events[-1].payload["actual"], 2)

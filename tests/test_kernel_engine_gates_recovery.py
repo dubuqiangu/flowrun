@@ -101,7 +101,7 @@ class KernelEngineRecoveryTestCase(KernelGatesHarnessTestCase):
 
         final_state = self.run_flow_once(flow_ir)
         self.assertEqual(final_state.node_status("H001"), "failed")
-        self.assertIn("retry", final_state.tripped_gates())
+        self.assertIn("retry_exhausted", final_state.tripped_gates())
         self.assertTrue(final_state.is_paused())
         self.assertEqual(final_state.node_status("T002"), "planned")
 
@@ -182,7 +182,7 @@ class DecisionNodeTimeoutRecoveryTestCase(KernelGatesHarnessTestCase):
             "最近一次 agent_exited 带 timed_out → 走超时分支边",
         )
         self.assertNotIn(verdict_target.node_id, taken_targets)
-        self.assertNotIn("retry", final_state.tripped_gates())
+        self.assertNotIn("retry_exhausted", final_state.tripped_gates())
         self.assertEqual(
             support.events_of_type(ledger, "node_entered", "D001"),
             [],
@@ -209,7 +209,7 @@ class DecisionNodeTimeoutRecoveryTestCase(KernelGatesHarnessTestCase):
         final_state = self.run_flow_once(flow_ir)
 
         self.assertIn(
-            "retry", final_state.tripped_gates(), "没有超时事实 → 退回重试耗尽闸"
+            "retry_exhausted", final_state.tripped_gates(), "没有超时事实 → 退回重试耗尽闸"
         )
         self.assertTrue(final_state.is_paused())
         taken_targets = [

@@ -141,7 +141,8 @@ class GateExemptionTestCase(unittest.TestCase):
         )
 
     def test_repeated_runs_do_not_duplicate_retry_gate(self) -> None:
-        """FIX-B2：retry 闸触发后反复 run，tripped_gates() 不得变成 ("retry","retry",...)。"""
+        """FIX-B2：retry_exhausted 闸触发后反复 run，tripped_gates() 不得变成
+        ("retry_exhausted","retry_exhausted",...)。"""
         failing_task = support.make_node("T001")
         flow_ir = support.make_flow_ir([failing_task], [])
         self.stubs.script_dispatch_result("T001", support.make_dispatch_result(exit_code=3))
@@ -150,13 +151,13 @@ class GateExemptionTestCase(unittest.TestCase):
         for _repeat in range(2):
             final_state = self.run_flow_once(flow_ir)
 
-        self.assertEqual(final_state.tripped_gates(), ("retry",))
-        self.assertEqual(len(self.gate_events_named("retry")), 1)
+        self.assertEqual(final_state.tripped_gates(), ("retry_exhausted",))
+        self.assertEqual(len(self.gate_events_named("retry_exhausted")), 1)
 
     # ---------------------------------------------------------------- 每闸至多一次
 
     def test_parallel_failures_trip_retry_gate_only_once(self) -> None:
-        """FIX-B2：同轮两个无重试边的任务各失败 → retry 闸只落一条（每工作区每闸至多一次）。"""
+        """FIX-B2：同轮两个无重试边的任务各失败 → retry_exhausted 闸只落一条（每工作区每闸至多一次）。"""
         first_failing_task = support.make_node("T001")
         second_failing_task = support.make_node("T002")
         flow_ir = support.make_flow_ir([first_failing_task, second_failing_task], [])
@@ -166,8 +167,8 @@ class GateExemptionTestCase(unittest.TestCase):
         final_state = self.run_flow_once(flow_ir)
 
         self.assertTrue(final_state.is_paused())
-        self.assertEqual(final_state.tripped_gates(), ("retry",))
-        self.assertEqual(len(self.gate_events_named("retry")), 1)
+        self.assertEqual(final_state.tripped_gates(), ("retry_exhausted",))
+        self.assertEqual(len(self.gate_events_named("retry_exhausted")), 1)
 
     # ---------------------------------------------------------------- resume 永久豁免
 
@@ -322,7 +323,7 @@ class GateExemptionTestCase(unittest.TestCase):
         )
         self.assertNotIn("hop", final_state.tripped_gates()[1:], "hop 闸不得重复触发")
         self.assertEqual(len(self.gate_events_named("hop")), 1)
-        self.assertIn("retry", final_state.tripped_gates())
+        self.assertIn("retry_exhausted", final_state.tripped_gates())
 
 
 if __name__ == "__main__":

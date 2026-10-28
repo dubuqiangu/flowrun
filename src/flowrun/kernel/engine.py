@@ -63,7 +63,7 @@ from .engine_gates import (
     FAILURE_ACTION_REQUEUE,
     FAILURE_ACTION_TIMEOUT_BRANCH,
     FAILURE_ACTION_TRIP_GATE,
-    GATE_RETRY,
+    GATE_RETRY_EXHAUSTED,
     GateFinding,
     append_edge_taken,
     count_node_events,
@@ -335,10 +335,10 @@ def activate_finished_nodes(
 def _apply_failure_policy(
     flow_ir: FlowIR, ledger: EventLedger, node_id: str
 ) -> None:
-    """执行 engine_gates 给出的失败处置（超时分支 / 重入队 / retry 闸）。
+    """执行 engine_gates 给出的失败处置（超时分支 / 重入队 / retry_exhausted 闸）。
 
-    retry 闸同样受"每工作区每闸名至多一次"约束（FIX-B2）：同轮多个节点一起
-    失败、或 resume 后反复 run，都只留一条 retry 闸记录。
+    retry_exhausted 闸同样受"每工作区每闸名至多一次"约束（FIX-B2）：同轮多个节点
+    一起失败、或 resume 后反复 run，都只留一条 retry_exhausted 闸记录。
     """
     run_name = flow_ir.run_name
     failure_policy = resolve_failed_node_policy(flow_ir, ledger, node_id)
@@ -358,6 +358,6 @@ def _apply_failure_policy(
     elif failure_policy.action == FAILURE_ACTION_TRIP_GATE:
         trip_gate(
             ledger, run_name,
-            GateFinding(GATE_RETRY, failure_policy.failures_so_far, failure_policy.retry_limit),
+            GateFinding(GATE_RETRY_EXHAUSTED, failure_policy.failures_so_far, failure_policy.retry_limit),
             node_id,
         )

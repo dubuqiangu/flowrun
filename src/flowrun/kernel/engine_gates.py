@@ -6,14 +6,14 @@
 闸清单：
 - ``hop``：agent 投递跳数 > 4×节点数（防判定/重试构成的失控循环）；
 - ``budget``：累计 token > frontmatter budget_tokens；
-- ``retry``：失败节点重试耗尽（或根本没有重试边）；
+- ``retry_exhausted``：失败节点重试耗尽（或根本没有重试边）→ 转人审；
 - ``verdict``：判定器自报 tripped（低置信 / 证据不足）；
 - ``illegal_edge``：verdict 选中的目标不在判定节点的出边集合内。
 
 失败处置（⑤ 的 failed 分支，按优先级）：
 1. 失败原因为超时且存在超时分支边 → 走超时分支（"定时器先到即走此边"）；
 2. 存在重试边且失败次数未耗尽 → 重新入队重跑（node_entered，attempt 递增）；
-3. 否则 → ``gate_tripped(gate="retry")`` 转人审。
+3. 否则 → ``gate_tripped(gate="retry_exhausted")`` 转人审。
 
 计数与幂等：失败/闸的发生次数都从 ledger 事件现算（重放等价——
 "ready 的唯一来源是 ledger 事件"），idem 幂等键带 occurrence 段，
@@ -51,6 +51,7 @@ __all__ = [
     "GATE_HOP",
     "GATE_BUDGET",
     "GATE_RETRY",
+    "GATE_RETRY_EXHAUSTED",
     "GATE_VERDICT",
     "GATE_ILLEGAL_EDGE",
     "HOP_LIMIT_PER_NODE",
@@ -82,7 +83,8 @@ __all__ = [
 
 GATE_HOP = "hop"
 GATE_BUDGET = "budget"
-GATE_RETRY = "retry"
+GATE_RETRY = "retry"  # 废弃待删：失败/重试耗尽处置现走 GATE_RETRY_EXHAUSTED，src/ 内已无消费者，仅保留兼容旧账本
+GATE_RETRY_EXHAUSTED = "retry_exhausted"
 GATE_VERDICT = "verdict"
 GATE_ILLEGAL_EDGE = "illegal_edge"
 
