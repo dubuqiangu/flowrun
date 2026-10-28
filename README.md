@@ -97,9 +97,13 @@ python examples/demo/run_demo.py --keep    # 保留工作区,自己翻账本与�
 
 ## 文档
 
+- [docs/index.md](docs/index.md) — 文档索引(入口)
+- [docs/usage.md](docs/usage.md) — CLI 使用手册:全部命令/参数/退出码/`flow.mmd` 语法
 - [design.md](design.md) — 设计总览:五域架构、图语法、事件文法、闸与恢复语义
 - [interfaces.md](interfaces.md) — 域间接口契约(冻结件)
 - [tasks.md](tasks.md) — 任务清单与验收标准(M1 已收官)
+- [CHANGELOG.md](CHANGELOG.md) — 版本迭代记录
+- [CONTRIBUTING.md](CONTRIBUTING.md) — 贡献指南
 
 ## 开发
 
